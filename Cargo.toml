@@ -1,6 +1,6 @@
 [package]
 name    = "marcopolo"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -8,13 +8,15 @@ name = "marcopolo"
 path = "src/main.rs"
 
 [dependencies]
-base64    = "0.22"
-colored   = "2"
-futures   = "0.3"
-indicatif = "0.17"
-regex     = "1"
-reqwest   = { version = "0.12", features = ["json"] }
-scraper = "0.26.0"
-serde     = { version = "1",    features = ["derive"] }
-tokio     = { version = "1",    features = ["full"] }
-url       = "2"
+base64            = "0.22"
+clap              = { version = "4",    features = ["derive"] }
+colored           = "2"
+futures           = "0.3"
+indicatif         = "0.17"
+percent-encoding  = "2"
+regex             = "1"
+reqwest           = { version = "0.12", features = ["json"] }
+scraper           = "0.21"
+serde             = { version = "1",    features = ["derive"] }
+tokio             = { version = "1",    features = ["full"] }
+url               = "2"
