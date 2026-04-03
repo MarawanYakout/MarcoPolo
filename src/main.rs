@@ -1,18 +1,15 @@
-//! marcopolo v0.3 — multi-type file hunter & downloader
+//! marcopolo v0.4 — multi-type file hunter & downloader + free-book search engine
 //!
-//! Supports downloading PDFs, text documents, images, and videos
-//! from GitHub repositories or any website.
-//!
-//! # Usage
+//! # Subcommands
 //! ```text
-//! marcopolo <url> [OPTIONS]
-//!
-//! marcopolo https://github.com/owner/repo --type pdf --type img
-//! marcopolo https://somesite.com --type video --depth 2
-//! marcopolo https://github.com/owner/repo/tree/master/books --list
-//! marcopolo https://somesite.com --type pdf --type text --out ~/downloads
+//! marcopolo scrape <URL> [OPTIONS]   — crawl a GitHub repo or any website
+//! marcopolo find   <QUERY> [OPTIONS] — search Archive.org, Open Library,
+//!                                      Gutenberg, and Anna's Archive
 //! ```
 
+mod cli;
+mod find;
+mod utils;
 mod web_scraper;
 
 // ── Standard library ──────────────────────────────────────────────────────────
@@ -91,60 +88,6 @@ pub fn matches_ext(path: &str, exts: &[&str]) -> bool {
 }
 
 // =============================================================================
-// CLI
-// =============================================================================
-
-/// 🧭 Hunt and download files from GitHub repos or any website.
-#[derive(Parser, Debug)]
-#[command(name = "marcopolo", version = "0.3.0")]
-struct Args {
-    /// GitHub repo URL (optionally with /tree/<branch>/<subpath>) or any website
-    url: String,
-
-    /// File types to hunt (repeatable: --type pdf --type img)
-    #[arg(
-        long = "type",
-        short = 't',
-        value_enum,
-        default_values_t = vec![FileKind::Pdf],
-        num_args = 1..,
-    )]
-    kinds: Vec<FileKind>,
-
-    /// Output directory for downloaded files
-    #[arg(long, short = 'o', default_value = "downloads")]
-    out: PathBuf,
-
-    /// Link-depth to crawl (web mode only; 0 = landing page only)
-    #[arg(long, default_value_t = 1)]
-    depth: usize,
-
-    /// Milliseconds of delay between each download request
-    #[arg(long)]
-    delay: Option<u64>,
-
-    /// Append to partially downloaded files instead of re-downloading
-    #[arg(long = "continue", default_value_t = false)]
-    resume: bool,
-
-    /// Retry attempts per file before giving up
-    #[arg(long, default_value_t = 3)]
-    retries: u32,
-
-    /// List files without downloading (dry run)
-    #[arg(long, default_value_t = false)]
-    list: bool,
-
-    /// Only include files whose name contains this string (case-insensitive)
-    #[arg(long)]
-    filter: Option<String>,
-
-    /// GitHub personal access token (raises rate limit 60 → 5 000 req/hr)
-    #[arg(long)]
-    token: Option<String>,
-}
-
-// =============================================================================
 // Data models
 // =============================================================================
 
@@ -195,11 +138,6 @@ struct ReleaseAsset {
 // URL parsing
 // =============================================================================
 
-/// Extracts `(owner, repo, subpath)` from a GitHub URL.
-///
-/// Handles subdirectory URLs like:
-///   `github.com/owner/repo/tree/branch/some/sub/path`
-/// returning `subpath = Some("some/sub/path")`.
 fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>)> {
     let no_query = raw.split('?').next().unwrap_or(raw);
     let no_frag  = no_query.split('#').next().unwrap_or(no_query);
@@ -216,8 +154,6 @@ fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>)> {
 
     let owner = segs[0].to_owned();
     let repo  = segs[1].to_owned();
-
-    // /owner/repo/tree/<branch>/<subpath...>
     let subpath = if segs.len() > 4 && segs[2] == "tree" {
         Some(segs[4..].join("/"))
     } else {
@@ -241,8 +177,6 @@ async fn default_branch(client: &Client, owner: &str, repo: &str) -> Result<Stri
     Ok(info.default_branch)
 }
 
-/// Fetches and base64-decodes the content of a single file in the repo.
-/// Returns an empty string (not an error) when the file does not exist.
 async fn file_content(
     client: &Client,
     owner:  &str,
@@ -263,8 +197,6 @@ async fn file_content(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Returns every blob in the repo tree whose extension matches `exts`.
-/// When `subpath` is given, only blobs under that directory are returned.
 async fn repo_files(
     client:  &Client,
     owner:   &str,
@@ -313,8 +245,6 @@ async fn repo_files(
     Ok(sources)
 }
 
-/// Decodes the root README *and* the subpath README (if given), extracts
-/// every link whose extension matches `exts`. Results are deduplicated.
 async fn readme_files(
     client:  &Client,
     owner:   &str,
@@ -322,7 +252,6 @@ async fn readme_files(
     exts:    &[&str],
     subpath: Option<&str>,
 ) -> Result<Vec<FileSource>> {
-    // ── Root README via the dedicated GitHub endpoint ─────────────────────────
     let root_text = async {
         let url  = format!("https://api.github.com/repos/{owner}/{repo}/readme");
         let resp = client.get(&url).send().await?;
@@ -335,7 +264,6 @@ async fn readme_files(
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     };
 
-    // ── Subpath README (e.g. books/README.md) ────────────────────────────────
     let sub_text = async {
         match subpath {
             Some(sp) => file_content(client, owner, repo, &format!("{sp}/README.md")).await,
@@ -347,17 +275,14 @@ async fn readme_files(
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut all:  Vec<FileSource> = Vec::new();
-
     for text in [root.unwrap_or_default(), sub.unwrap_or_default()] {
         for f in extract_file_links(&text, exts) {
             if seen.insert(f.url.clone()) { all.push(f); }
         }
     }
-
     Ok(all)
 }
 
-/// Scans all GitHub Releases for attached assets matching `exts`.
 async fn release_files(
     client: &Client,
     owner:  &str,
@@ -381,14 +306,8 @@ async fn release_files(
     Ok(files)
 }
 
-/// Extracts all matching URLs from plain text or Markdown.
-///
-/// BUG FIX: raw string uses single backslashes so the regex engine receives
-/// `\s`, `\)`, `\.` — not `\\s`, `\\)`, `\\.` which would match literal
-/// backslash characters instead of whitespace / punctuation / literal dot.
 pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
     let ext_alt = exts.join("|");
-    // Single `\` in raw string r#"..."# → correct regex metacharacters
     let pattern = format!(r#"https?://[^\s\)\]"'>]+\.(?i:{ext_alt})(?:[^\s\)\]"'>]*)"#);
     let re      = Regex::new(&pattern).unwrap();
     let mut seen = HashSet::new();
@@ -411,6 +330,17 @@ pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
 // =============================================================================
 
 async fn download_file(
+    client:   &Client,
+    url:      &str,
+    dest:     &PathBuf,
+) -> Result<()> {
+    let resp  = client.get(url).send().await?.error_for_status()?;
+    let bytes = resp.bytes().await?;
+    tokio::fs::write(dest, &bytes).await?;
+    Ok(())
+}
+
+async fn download_file_full(
     client:   &Client,
     src:      &FileSource,
     dir:      &Path,
@@ -470,7 +400,6 @@ async fn download_file(
         let resp = match resp.error_for_status() {
             Ok(r)  => r,
             Err(e) => {
-                // 4xx errors are not retryable
                 if e.status().map(|s| s.is_client_error()).unwrap_or(false) {
                     return Err(e.into());
                 }
@@ -505,159 +434,245 @@ async fn download_file(
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-    let exts = all_extensions(&args.kinds);
+    if let Err(e) = run().await {
+        eprintln!("{} {e}", "error:".red().bold());
+        std::process::exit(1);
+    }
+}
 
-    let kinds_label = args.kinds.iter()
-        .map(|k| k.label().cyan().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    println!(
-        "{} {}  [{}]",
-        "🧭 marcopolo →".cyan().bold(),
-        args.url.yellow().bold(),
-        kinds_label,
-    );
+async fn run() -> Result<()> {
+    use cli::{Cli, Command};
+    let cli = Cli::parse();
 
     // ── Build HTTP client ──────────────────────────────────────────────────────
-    let mut default_headers = header::HeaderMap::new();
-    default_headers.insert(
-        header::ACCEPT,
-        header::HeaderValue::from_static("application/vnd.github+json"),
-    );
-    if let Some(ref token) = args.token {
-        if let Ok(val) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
-            default_headers.insert(header::AUTHORIZATION, val);
-            println!("{} using GitHub token", "→".dimmed());
-        }
-    }
-
-    let client = Client::builder()
-        .user_agent("marcopolo/0.3 (multi-type file downloader)")
-        .default_headers(default_headers)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client");
-
-    // ── Discover files ─────────────────────────────────────────────────────────
-    let mut all: Vec<FileSource> = if args.url.contains("github.com") {
-
-        let (owner, repo, subpath) = match parse_github_url(&args.url) {
-            Ok(t)  => t,
-            Err(e) => { eprintln!("{} {e}", "error:".red().bold()); std::process::exit(1); }
-        };
-
-        if let Some(ref sp) = subpath {
-            println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
-        }
-
-        println!("{} scanning repo tree, README, and releases …", "→".dimmed());
-
-        let branch = match default_branch(&client, &owner, &repo).await {
-            Ok(b)  => b,
-            Err(e) => { eprintln!("{} {e}", "error:".red().bold()); std::process::exit(1); }
-        };
-
-        let sp = subpath.as_deref();
-
-        let (tree_r, readme_r, releases_r) = tokio::join!(
-            repo_files(&client, &owner, &repo, &branch, &exts, sp),
-            readme_files(&client, &owner, &repo, &exts, sp),
-            release_files(&client, &owner, &repo, &exts),
+    let build_client = |token: Option<&str>| -> Result<Client> {
+        let mut default_headers = header::HeaderMap::new();
+        default_headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/vnd.github+json"),
         );
-
-        let mut seen:  HashSet<String> = HashSet::new();
-        let mut files: Vec<FileSource> = Vec::new();
-        for f in tree_r.unwrap_or_default()
-            .into_iter()
-            .chain(readme_r.unwrap_or_default())
-            .chain(releases_r.unwrap_or_default())
-        {
-            if seen.insert(f.url.clone()) { files.push(f); }
+        if let Some(t) = token {
+            if let Ok(val) = header::HeaderValue::from_str(&format!("Bearer {t}")) {
+                default_headers.insert(header::AUTHORIZATION, val);
+            }
         }
-        files
-
-    } else {
-
-        println!(
-            "{} scanning web page (depth: {}) …",
-            "→".dimmed(),
-            args.depth.to_string().cyan(),
-        );
-        match web_scraper::scrape_files(&client, &args.url, args.depth, &exts).await {
-            Ok(files) => files,
-            Err(e)    => { eprintln!("{} {e}", "error:".red().bold()); std::process::exit(1); }
-        }
-
+        Ok(Client::builder()
+            .user_agent("marcopolo/0.4 (multi-type file downloader + book finder)")
+            .default_headers(default_headers)
+            .timeout(Duration::from_secs(30))
+            .build()?)
     };
 
-    // ── Apply --filter ─────────────────────────────────────────────────────────
-    if let Some(ref kw) = args.filter {
-        let kw_lower = kw.to_lowercase();
-        all.retain(|f| f.name.to_lowercase().contains(&kw_lower));
-        println!(
-            "{} filter \"{}\" → {} match(es)",
-            "→".dimmed(), kw.cyan(), all.len().to_string().green(),
-        );
-    }
+    match cli.command {
+        // ── scrape subcommand ──────────────────────────────────────────────────
+        Command::Scrape { url, kinds, out, depth, delay, resume, retries, list, filter, token } => {
+            let client = build_client(token.as_deref())?;
+            let exts   = all_extensions(&kinds);
 
-    if all.is_empty() {
-        println!("{}", "No files found.".yellow());
-        return;
-    }
+            let kinds_label = kinds.iter()
+                .map(|k| k.label().cyan().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
 
-    println!(
-        "{} {} file(s) discovered",
-        "✓".green().bold(),
-        all.len().to_string().green().bold(),
-    );
-
-    // ── --list dry-run ─────────────────────────────────────────────────────────
-    if args.list {
-        println!("\n{}", "Discovered files:".cyan().bold());
-        for (i, f) in all.iter().enumerate() {
             println!(
-                "  {}  {}  {}",
-                format!("[{}]", i + 1).dimmed(),
-                f.name.green(),
-                f.url.dimmed(),
+                "{} {}  [{}]",
+                "🧭 marcopolo scrape →".cyan().bold(),
+                url.yellow().bold(),
+                kinds_label,
+            );
+
+            let mut all: Vec<FileSource> = if url.contains("github.com") {
+                let (owner, repo, subpath) = parse_github_url(&url)?;
+
+                if let Some(ref sp) = subpath {
+                    println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
+                }
+
+                println!("{} scanning repo tree, README, and releases …", "→".dimmed());
+
+                let branch = default_branch(&client, &owner, &repo).await?;
+                let sp     = subpath.as_deref();
+
+                let (tree_r, readme_r, releases_r) = tokio::join!(
+                    repo_files(&client, &owner, &repo, &branch, &exts, sp),
+                    readme_files(&client, &owner, &repo, &exts, sp),
+                    release_files(&client, &owner, &repo, &exts),
+                );
+
+                let mut seen:  HashSet<String> = HashSet::new();
+                let mut files: Vec<FileSource> = Vec::new();
+                for f in tree_r.unwrap_or_default()
+                    .into_iter()
+                    .chain(readme_r.unwrap_or_default())
+                    .chain(releases_r.unwrap_or_default())
+                {
+                    if seen.insert(f.url.clone()) { files.push(f); }
+                }
+                files
+            } else {
+                println!(
+                    "{} scanning web page (depth: {}) …",
+                    "→".dimmed(),
+                    depth.to_string().cyan(),
+                );
+                web_scraper::scrape_files(&client, &url, depth, &exts).await?
+            };
+
+            if let Some(ref kw) = filter {
+                let kw_lower = kw.to_lowercase();
+                all.retain(|f| f.name.to_lowercase().contains(&kw_lower));
+                println!(
+                    "{} filter \"{}\" → {} match(es)",
+                    "→".dimmed(), kw.cyan(), all.len().to_string().green(),
+                );
+            }
+
+            if all.is_empty() {
+                println!("{}", "No files found.".yellow());
+                return Ok(());
+            }
+
+            println!(
+                "{} {} file(s) discovered",
+                "✓".green().bold(),
+                all.len().to_string().green().bold(),
+            );
+
+            if list {
+                println!("\n{}", "Discovered files:".cyan().bold());
+                for (i, f) in all.iter().enumerate() {
+                    println!(
+                        "  {}  {}  {}",
+                        format!("[{}]", i + 1).dimmed(),
+                        f.name.green(),
+                        f.url.dimmed(),
+                    );
+                }
+                return Ok(());
+            }
+
+            tokio::fs::create_dir_all(&out).await?;
+
+            let pb = ProgressBar::new(all.len() as u64);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.cyan} [{bar:45.cyan/blue}] {pos}/{len}  {msg}",
+                )
+                .unwrap()
+                .progress_chars("█▓░"),
+            );
+
+            stream::iter(all.iter())
+                .map(|src| download_file_full(&client, src, &out, &pb, resume, delay, retries))
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .for_each(|r| {
+                    if let Err(e) = r { eprintln!("{} {e}", "download error:".red()); }
+                });
+
+            pb.finish_with_message("done ✓");
+            println!(
+                "\n{} all files saved to {}",
+                "✓".green().bold(),
+                out.display().to_string().cyan().bold(),
             );
         }
-        return;
+
+        // ── find subcommand ────────────────────────────────────────────────────
+        Command::Find { query, list, get, source, out, token } => {
+            let client = build_client(token.as_deref())?;
+
+            // Validate --source flag if provided.
+            if let Some(ref src) = source {
+                if let Err(e) = utils::validation::validate_source(src) {
+                    eprintln!("{} {e}", "error:".red().bold());
+                    std::process::exit(1);
+                }
+            }
+
+            if !utils::validation::is_valid_query(&query) {
+                eprintln!("{} query must not be empty.", "error:".red().bold());
+                std::process::exit(1);
+            }
+
+            println!(
+                "{} \"{}\"  [archive.org · openlibrary · gutenberg · anna's archive]",
+                "🔍 marcopolo find →".cyan().bold(),
+                query.yellow().bold(),
+            );
+
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} {msg}")
+                    .unwrap(),
+            );
+            pb.set_message("Searching …");
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+            let results = find::search_all(&client, &query, source.as_deref()).await;
+
+            pb.finish_and_clear();
+
+            if results.is_empty() {
+                println!("{} No results found for \"{}\".", "✗".red(), query);
+                return Ok(());
+            }
+
+            println!(
+                "{} {} result(s) for \"{}\":\n",
+                "✓".green().bold(),
+                results.len().to_string().green().bold(),
+                query.yellow(),
+            );
+
+            for (i, r) in results.iter().enumerate() {
+                let fmt_tag = r.format
+                    .as_deref()
+                    .unwrap_or("?")
+                    .to_uppercase();
+                println!(
+                    "  {} [{:>18}]  {:>5}  {}",
+                    format!("[{:>2}]", i + 1).dimmed(),
+                    r.source.yellow(),
+                    fmt_tag.cyan(),
+                    r.title,
+                );
+                println!("          {}", r.url.dimmed());
+            }
+
+            if list {
+                // Already printed — done.
+                return Ok(());
+            }
+
+            if get {
+                tokio::fs::create_dir_all(&out).await?;
+                println!(
+                    "\n{} downloading {} file(s) → {}",
+                    "↓".cyan().bold(),
+                    results.len(),
+                    out.display().to_string().cyan(),
+                );
+
+                for r in &results {
+                    let dest = out.join(&r.filename);
+                    match download_file(&client, &r.url, &dest).await {
+                        Ok(_)  => println!("  {} [{}] {}", "✓".green(), r.source, r.filename),
+                        Err(e) => println!("  {} [{}] {}: {e}", "✗".red(), r.source, r.filename),
+                    }
+                }
+            } else {
+                println!(
+                    "\n{} pass {} to download.",
+                    "tip:".dimmed(),
+                    "--get".cyan(),
+                );
+            }
+        }
     }
 
-    // ── Download ───────────────────────────────────────────────────────────────
-    tokio::fs::create_dir_all(&args.out).await.expect("cannot create output directory");
-
-    let pb = ProgressBar::new(all.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{bar:45.cyan/blue}] {pos}/{len}  {msg}",
-        )
-        .unwrap()
-        .progress_chars("█▓░"),
-    );
-
-    let out   = args.out.clone();
-    let res   = args.resume;
-    let delay = args.delay;
-    let retry = args.retries;
-
-    stream::iter(all.iter())
-        .map(|src| download_file(&client, src, &out, &pb, res, delay, retry))
-        .buffer_unordered(4)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .for_each(|r| {
-            if let Err(e) = r { eprintln!("{} {e}", "download error:".red()); }
-        });
-
-    pb.finish_with_message("done ✓");
-    println!(
-        "\n{} all files saved to {}",
-        "✓".green().bold(),
-        args.out.display().to_string().cyan().bold(),
-    );
+    Ok(())
 }

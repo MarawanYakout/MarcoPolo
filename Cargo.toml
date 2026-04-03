@@ -1,14 +1,14 @@
 [package]
 name        = "marcopolo"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
-description = "Scrape any URL, grab any file — one command. Async CLI tool for hunting and bulk-downloading PDFs, images, videos, source code, and more from GitHub repos and websites."
+description = "Scrape any URL, grab any file — one command. Async CLI tool for hunting and bulk-downloading PDFs, images, videos, source code, and more from GitHub repos and websites. Also: multi-source free-book search engine."
 readme      = "README.md"
 license     = "MIT or Apache 2.0"
 authors     = ["Marawan Yakout yakout@marawan.net"]
 repository  = "https://github.com/MarawanYakout/MarcoPolo"
 homepage    = "https://github.com/MarawanYakout/MarcoPolo"
-keywords    = ["scraper", "downloader", "cli", "github", "crawler", "rust scraper"]
+keywords    = ["scraper", "downloader", "cli", "github", "crawler", "book-search"]
 categories  = [
     "command-line-utilities",
     "web-programming",
@@ -30,5 +30,6 @@ regex             = "1"
 reqwest           = { version = "0.12", features = ["json"] }
 scraper           = "0.21"
 serde             = { version = "1",    features = ["derive"] }
+serde_json        = "1"
 tokio             = { version = "1",    features = ["full"] }
 url               = "2"
