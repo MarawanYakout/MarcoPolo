@@ -15,6 +15,7 @@ mod web_scraper;
 // ── Standard library ──────────────────────────────────────────────────────────
 use std::{
     collections::HashSet,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -316,7 +317,8 @@ pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
         .filter_map(|m| {
             let url = m.as_str().to_owned();
             if !seen.insert(url.clone()) { return None; }
-            let name = url.split('/').last()
+            let name = url.split('/')
+                .last()
                 .and_then(|s| s.split('?').next())
                 .unwrap_or("unknown")
                 .to_owned();
@@ -330,9 +332,9 @@ pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
 // =============================================================================
 
 async fn download_file(
-    client:   &Client,
-    url:      &str,
-    dest:     &PathBuf,
+    client: &Client,
+    url:    &str,
+    dest:   &PathBuf,
 ) -> Result<()> {
     let resp  = client.get(url).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?;
@@ -426,6 +428,59 @@ async fn download_file_full(
     }
 
     Err(last_err.unwrap_or_else(|| "download failed after all retries".into()))
+}
+
+// =============================================================================
+// Interactive selection helper
+// =============================================================================
+
+/// Parse a user's selection string into a set of 0-based indices.
+///
+/// Accepts:
+/// - `"a"` or `"all"` → selects every index in `0..count`
+/// - `"1 3 5"` / `"1,3,5"` / `"1-3"` → specific numbers (1-based) or inclusive ranges
+///
+/// Invalid tokens are silently skipped.  Returns an empty `Vec` if nothing
+/// valid was entered (the caller should re-prompt).
+fn parse_selection(input: &str, count: usize) -> Vec<usize> {
+    let trimmed = input.trim().to_lowercase();
+    if trimmed == "a" || trimmed == "all" {
+        return (0..count).collect();
+    }
+
+    // Normalise separators: commas and whitespace → space
+    let normalised = trimmed.replace(',', " ");
+    let mut indices = Vec::new();
+
+    for token in normalised.split_whitespace() {
+        // Range token: "2-5"
+        if let Some((lo, hi)) = token.split_once('-') {
+            if let (Ok(a), Ok(b)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                for n in a..=b {
+                    if n >= 1 && n <= count {
+                        indices.push(n - 1);
+                    }
+                }
+            }
+        // Single number
+        } else if let Ok(n) = token.parse::<usize>() {
+            if n >= 1 && n <= count {
+                indices.push(n - 1);
+            }
+        }
+    }
+
+    // Deduplicate while preserving order
+    let mut seen = HashSet::new();
+    indices.retain(|i| seen.insert(*i));
+    indices
+}
+
+/// Block on a single line of stdin.  Returns an empty string on EOF.
+fn read_line_stdin() -> String {
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
+    buf
 }
 
 // =============================================================================
@@ -603,13 +658,14 @@ async fn run() -> Result<()> {
                 query.yellow().bold(),
             );
 
+            // ── Spinner while all sources are queried in parallel ──────────────
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.cyan} {msg}")
                     .unwrap(),
             );
-            pb.set_message("Searching …");
+            pb.set_message("Searching all sources …");
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
             let results = find::search_all(&client, &query, source.as_deref()).await;
@@ -621,8 +677,14 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
+            // ── Numbered result list ───────────────────────────────────────────
+            //
+            // Format:
+            //   1. (archive.org)      Clean Code.pdf
+            //      https://archive.org/download/…
+            //
             println!(
-                "{} {} result(s) for \"{}\":\n",
+                "\n{} {} result(s) for \"{}\":\n",
                 "✓".green().bold(),
                 results.len().to_string().green().bold(),
                 query.yellow(),
@@ -631,48 +693,238 @@ async fn run() -> Result<()> {
             for (i, r) in results.iter().enumerate() {
                 let fmt_tag = r.format
                     .as_deref()
-                    .unwrap_or("?")
-                    .to_uppercase();
+                    .map(|f| format!(" [{}]", f.to_uppercase()))
+                    .unwrap_or_default();
+
                 println!(
-                    "  {} [{:>18}]  {:>5}  {}",
-                    format!("[{:>2}]", i + 1).dimmed(),
+                    "  {}. ({})  {}{}",
+                    format!("{:>2}", i + 1).bold(),
                     r.source.yellow(),
+                    r.title.green(),
                     fmt_tag.cyan(),
-                    r.title,
                 );
-                println!("          {}", r.url.dimmed());
+                println!("      {}", r.url.dimmed());
+                println!();
             }
 
+            // ── --list: print only, no prompt ──────────────────────────────────
             if list {
-                // Already printed — done.
                 return Ok(());
             }
 
-            if get {
-                tokio::fs::create_dir_all(&out).await?;
+            // ── --get: skip prompt, download everything ────────────────────────
+            let chosen: Vec<usize> = if get {
+                (0..results.len()).collect()
+            } else {
+                // ── Interactive selection prompt ───────────────────────────────
+                //
+                // Accepts:
+                //   "1"        → download result 1
+                //   "1 3"      → download results 1 and 3
+                //   "1,3,5"    → same with comma separators
+                //   "1-4"      → inclusive range
+                //   "a" / "all"→ download everything
+                //   "q"        → quit without downloading
+                //
+                // Re-prompts once on invalid input.
                 println!(
-                    "\n{} downloading {} file(s) → {}",
-                    "↓".cyan().bold(),
-                    results.len(),
-                    out.display().to_string().cyan(),
+                    "{}",
+                    "──────────────────────────────────────────────".dimmed(),
+                );
+                println!(
+                    "  {} enter number(s) to download, {} for all, {} to quit",
+                    "select:".cyan().bold(),
+                    "a".green().bold(),
+                    "q".red().bold(),
+                );
+                println!(
+                    "  {} {}",
+                    "examples:".dimmed(),
+                    "1   |   1 3   |   2,4   |   1-3   |   a".dimmed(),
+                );
+                println!(
+                    "{}",
+                    "──────────────────────────────────────────────".dimmed(),
                 );
 
-                for r in &results {
-                    let dest = out.join(&r.filename);
-                    match download_file(&client, &r.url, &dest).await {
-                        Ok(_)  => println!("  {} [{}] {}", "✓".green(), r.source, r.filename),
-                        Err(e) => println!("  {} [{}] {}: {e}", "✗".red(), r.source, r.filename),
+                let mut selection = Vec::new();
+                let mut attempts  = 0usize;
+
+                loop {
+                    print!("{} ", "→".cyan().bold());
+                    io::stdout().flush().ok();
+
+                    let raw = read_line_stdin();
+                    let trimmed = raw.trim().to_lowercase();
+
+                    if trimmed == "q" || trimmed == "quit" || trimmed.is_empty() {
+                        println!("{} nothing downloaded.", "✗".dimmed());
+                        return Ok(());
+                    }
+
+                    selection = parse_selection(&trimmed, results.len());
+
+                    if !selection.is_empty() {
+                        break;
+                    }
+
+                    attempts += 1;
+                    if attempts >= 3 {
+                        println!("{} no valid selection — aborting.", "✗".red());
+                        return Ok(());
+                    }
+                    eprintln!(
+                        "{} unrecognised input — enter a number (e.g. {}) or {} for all",
+                        "!".yellow().bold(),
+                        "1".cyan(),
+                        "a".green(),
+                    );
+                }
+
+                selection
+            };
+
+            if chosen.is_empty() {
+                return Ok(());
+            }
+
+            // ── Download selected results ──────────────────────────────────────
+            tokio::fs::create_dir_all(&out).await?;
+
+            println!(
+                "\n{} downloading {} file(s) → {}",
+                "↓".cyan().bold(),
+                chosen.len(),
+                out.display().to_string().cyan(),
+            );
+
+            let pb_dl = ProgressBar::new(chosen.len() as u64);
+            pb_dl.set_style(
+                ProgressStyle::with_template(
+                    "  {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {msg}"
+                )
+                .unwrap()
+                .progress_chars("█▓░"),
+            );
+
+            let mut errors: Vec<String> = Vec::new();
+
+            for idx in &chosen {
+                let r    = &results[*idx];
+                let dest = out.join(&r.filename);
+                pb_dl.set_message(format!("{}", r.filename.dimmed()));
+
+                match download_file(&client, &r.url, &dest).await {
+                    Ok(()) => {
+                        pb_dl.println(format!(
+                            "  {} ({})  {}",
+                            "✓".green().bold(),
+                            r.source.yellow(),
+                            r.filename,
+                        ));
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "  {} ({})  {}:  {e}",
+                            "✗".red().bold(),
+                            r.source.yellow(),
+                            r.filename,
+                        );
+                        pb_dl.println(msg.clone());
+                        errors.push(msg);
                     }
                 }
-            } else {
+                pb_dl.inc(1);
+            }
+
+            pb_dl.finish_and_clear();
+
+            let ok_count = chosen.len() - errors.len();
+            if ok_count > 0 {
                 println!(
-                    "\n{} pass {} to download.",
-                    "tip:".dimmed(),
-                    "--get".cyan(),
+                    "\n{} {} file(s) saved to {}",
+                    "✓".green().bold(),
+                    ok_count.to_string().green().bold(),
+                    out.display().to_string().cyan().bold(),
+                );
+            }
+            if !errors.is_empty() {
+                println!(
+                    "{} {} download(s) failed.",
+                    "✗".red().bold(),
+                    errors.len().to_string().red(),
                 );
             }
         }
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Tests — selection parser
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::parse_selection;
+
+    #[test]
+    fn select_single() {
+        assert_eq!(parse_selection("1", 5), vec![0]);
+    }
+
+    #[test]
+    fn select_multiple_space() {
+        assert_eq!(parse_selection("1 3 5", 5), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn select_multiple_comma() {
+        assert_eq!(parse_selection("2,4", 5), vec![1, 3]);
+    }
+
+    #[test]
+    fn select_range() {
+        assert_eq!(parse_selection("1-3", 5), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_all_a() {
+        assert_eq!(parse_selection("a", 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_all_word() {
+        assert_eq!(parse_selection("all", 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_out_of_range_ignored() {
+        // 6 is beyond count=5 → ignored
+        assert_eq!(parse_selection("1 6", 5), vec![0]);
+    }
+
+    #[test]
+    fn select_zero_ignored() {
+        // 0 is not a valid 1-based index
+        assert_eq!(parse_selection("0 1", 5), vec![0]);
+    }
+
+    #[test]
+    fn select_deduplication() {
+        // "1 1 2" → [0, 1]
+        assert_eq!(parse_selection("1 1 2", 5), vec![0, 1]);
+    }
+
+    #[test]
+    fn select_invalid_returns_empty() {
+        assert!(parse_selection("foo bar", 5).is_empty());
+    }
+
+    #[test]
+    fn select_q_returns_empty() {
+        // "q" is handled before parse_selection is called; it's not a valid token
+        assert!(parse_selection("q", 5).is_empty());
+    }
 }
