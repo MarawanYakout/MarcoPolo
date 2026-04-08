@@ -326,7 +326,7 @@ marcopolo https://somesite.com/resources --type pdf --depth 2 --filter "2024"
 
 ---
 
-## 📚 Find Mode (New)
+##  Find Mode (New) - Finding Books at important parts of the internet
 
 Marcopolo now includes a powerful `find` command to search for free books and documents across the web's largest open libraries.
 
