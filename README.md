@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.png" width="400" />
+
 # 🗺️ Marcopolo
 
 <img src="https://img.shields.io/badge/version-0.3.0-4f98a3?style=for-the-badge&logoColor=white" />
@@ -320,6 +322,42 @@ marcopolo https://somesite.com/resources --type pdf --depth 2 --list
 
 # Step 2 — download only what you want
 marcopolo https://somesite.com/resources --type pdf --depth 2 --filter "2024"
+```
+
+---
+
+## 📚 Find Mode (New)
+
+Marcopolo now includes a powerful `find` command to search for free books and documents across the web's largest open libraries.
+
+### Search Sources
+When you use `find`, Marcopolo queries these sources in parallel:
+*   **Internet Archive** (archive.org) — Reliable JSON API
+*   **Open Library** (openlibrary.org) — Curated metadata
+*   **Project Gutenberg** (gutenberg.org) — Via Gutendex API
+*   **Anna's Archive** (annas-archive.org) — Real-time HTML scraping of the largest catalog
+
+### Usage Examples
+
+**Search and preview results (default):**
+```bash
+marcopolo find "Clean Code"
+```
+
+**Download the top match from each source:**
+```bash
+marcopolo find "The Pragmatic Programmer" --get --out ~/my-books
+```
+
+**Restrict search to a specific source:**
+```bash
+marcopolo find "Computer Systems" --source archive
+```
+*Options for `--source`: `archive`, `openlibrary`, `gutenberg`, `annas`*
+
+**List results for a specific query without downloading:**
+```bash
+marcopolo find "Rust Programming" --list
 ```
 
 ---
