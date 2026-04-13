@@ -497,7 +497,17 @@ async fn main() {
 
 async fn run() -> Result<()> {
     use cli::{Cli, Command};
-    let cli = Cli::parse();
+
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.len() > 1
+        && !args[1].starts_with('-')
+        && args[1] != "scrape"
+        && args[1] != "find"
+        && args[1] != "help"
+    {
+        args.insert(1, "scrape".to_string());
+    }
+    let cli = Cli::parse_from(args);
 
     // ── Build HTTP client ──────────────────────────────────────────────────────
     let build_client = |token: Option<&str>| -> Result<Client> {
