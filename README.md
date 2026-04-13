@@ -8,9 +8,8 @@
 <img src="https://img.shields.io/badge/rust-2021_edition-orange?style=for-the-badge&logo=rust&logoColor=white" />
 <img src="https://img.shields.io/badge/license-MIT-success?style=for-the-badge" />
 <img src="https://img.shields.io/badge/async-tokio-blue?style=for-the-badge&logo=tokio&logoColor=white" />
-<img src="https://img.shields.io/badge/built_with-❤️-red?style=for-the-badge" />
 
-**Scrape any URL. Grab any file. One command.**
+**Find Any Book, Scrape any URL. Grab Any File Type, Any Format. One command.**
 
 </div>
 
@@ -326,7 +325,7 @@ marcopolo https://somesite.com/resources --type pdf --depth 2 --filter "2024"
 
 ---
 
-## 📚 Find Mode (New)
+##  Find Mode (New) - Finding Books at important parts of the internet
 
 Marcopolo now includes a powerful `find` command to search for free books and documents across the web's largest open libraries.
 
