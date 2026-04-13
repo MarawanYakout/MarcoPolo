@@ -8,9 +8,8 @@
 <img src="https://img.shields.io/badge/rust-2021_edition-orange?style=for-the-badge&logo=rust&logoColor=white" />
 <img src="https://img.shields.io/badge/license-MIT-success?style=for-the-badge" />
 <img src="https://img.shields.io/badge/async-tokio-blue?style=for-the-badge&logo=tokio&logoColor=white" />
-<img src="https://img.shields.io/badge/built_with-❤️-red?style=for-the-badge" />
 
-**Scrape any URL. Grab any file. One command.**
+**Find Any Book, Scrape any URL. Grab Any File Type, Any Format. One command.**
 
 </div>
 
