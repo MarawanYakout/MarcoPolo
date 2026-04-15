@@ -336,8 +336,8 @@ When you use `find`, Marcopolo queries these sources in parallel:
 *   **Project Gutenberg** (gutenberg.org) — Via Gutendex API
 *   **Anna's Archive** (annas-archive.org) — Real-time HTML scraping of the largest catalog
 *   **Github** (Github.com) — Searches PDFs with similar names on github
-*   **Github** (Googlescholar.com) — Searches PDFs with similar names on Googlescholar
-*   **Github** (Duckduckgo.com) — Searches PDFs with similar names using Duckduckgo 0% data collection
+*   **Googlescholar** (Googlescholar.com) — Searches PDFs / Books / Articles with similar names on Googlescholar
+*   **Duckduckgo** (Duckduckgo.com) — Searches PDFs with similar names using Duckduckgo 0% data collection
 
 
 
