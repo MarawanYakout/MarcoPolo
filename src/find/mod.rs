@@ -5,6 +5,9 @@
 //! - [`openlibrary`] — Open Library (JSON API, curated)
 //! - [`gutenberg`] — Project Gutenberg via Gutendex (JSON API)
 //! - [`annas`]     — Anna's Archive (HTML scrape, largest catalog)
+//! - [`github`]    — GitHub repository code search
+//! - [`googlescholar`] — Google Scholar search
+//! - [`duckduckgo`] — DuckDuckGo filetype:pdf search
 //!
 //! # Quick start
 //! ```no_run
@@ -16,6 +19,9 @@ pub mod annas;
 pub mod archive;
 pub mod gutenberg;
 pub mod openlibrary;
+pub mod github;
+pub mod googlescholar;
+pub mod duckduckgo;
 pub mod types;
 
 use reqwest::Client;
@@ -23,7 +29,7 @@ use crate::utils::dedup::dedup_by_key;
 use crate::utils::validation::Source;
 use types::FindResult;
 
-/// Query all four sources in parallel and return a deduplicated result list.
+/// Query all sources in parallel and return a deduplicated result list.
 ///
 /// Pass `source_filter` to restrict to a single source identifier.
 pub async fn search_all(
@@ -41,13 +47,16 @@ pub async fn search_all(
         }};
     }
 
-    let (a, b, c, d) = tokio::join!(
-        async { run_source!(Source::Archive,     archive::search(client, query)) },
-        async { run_source!(Source::Openlibrary, openlibrary::search(client, query)) },
-        async { run_source!(Source::Gutenberg,   gutenberg::search(client, query)) },
-        async { run_source!(Source::Annas,       annas::search(client, query)) },
+    let (a, b, c, d, e, f, g) = tokio::join!(
+        async { run_source!(Source::Archive,       archive::search(client, query)) },
+        async { run_source!(Source::Openlibrary,   openlibrary::search(client, query)) },
+        async { run_source!(Source::Gutenberg,     gutenberg::search(client, query)) },
+        async { run_source!(Source::Annas,         annas::search(client, query)) },
+        async { run_source!(Source::Github,        github::search(client, query)) },
+        async { run_source!(Source::Googlescholar, googlescholar::search(client, query)) },
+        async { run_source!(Source::Duckduckgo,    duckduckgo::search(client, query)) },
     );
 
-    let all = [a, b, c, d].concat();
+    let all = [a, b, c, d, e, f, g].concat();
     dedup_by_key(all, |r| r.url.clone())
 }

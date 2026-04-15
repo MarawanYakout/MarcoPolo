@@ -69,7 +69,7 @@ pub enum Command {
 
     /// Search free book sources and optionally download results.
     ///
-    /// Sources queried in parallel: Archive.org, Open Library, Gutendex, Anna's Archive.
+    /// Sources queried in parallel: Archive.org, Open Library, Gutendex, Anna's Archive, GitHub, Google Scholar, DuckDuckGo.
     ///
     /// Examples:
     ///   marcopolo find "Clean Code"
@@ -88,7 +88,7 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         get: bool,
 
-        /// Restrict search to a single source (archive | openlibrary | gutenberg | annas).
+        /// Restrict search to a single source (archive | openlibrary | gutenberg | annas | github | googlescholar | duckduckgo).
         #[arg(long, value_enum, value_name = "SOURCE")]
         source: Option<crate::utils::validation::Source>,
 

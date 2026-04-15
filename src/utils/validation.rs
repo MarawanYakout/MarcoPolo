@@ -32,6 +32,9 @@ pub enum Source {
     Openlibrary,
     Gutenberg,
     Annas,
+    Github,
+    Googlescholar,
+    Duckduckgo,
 }
 
 impl Source {
@@ -40,6 +43,9 @@ impl Source {
         Source::Openlibrary,
         Source::Gutenberg,
         Source::Annas,
+        Source::Github,
+        Source::Googlescholar,
+        Source::Duckduckgo,
     ];
 }
 
@@ -50,6 +56,9 @@ impl fmt::Display for Source {
             Self::Openlibrary => write!(f, "openlibrary"),
             Self::Gutenberg => write!(f, "gutenberg"),
             Self::Annas => write!(f, "annas"),
+            Self::Github => write!(f, "github"),
+            Self::Googlescholar => write!(f, "googlescholar"),
+            Self::Duckduckgo => write!(f, "duckduckgo"),
         }
     }
 }

@@ -654,10 +654,17 @@ async fn run() -> Result<()> {
                 std::process::exit(1);
             }
 
+            let sources_label = if let Some(s) = &source {
+                format!("[{}]", s)
+            } else {
+                "[archive.org · openlibrary · gutenberg · anna's archive · github · googlescholar · duckduckgo]".to_string()
+            };
+
             println!(
-                "{} \"{}\"  [archive.org · openlibrary · gutenberg · anna's archive]",
+                "{} \"{}\"  {}",
                 "🔍 marcopolo find →".cyan().bold(),
                 query.yellow().bold(),
+                sources_label,
             );
 
             // ── Spinner while all sources are queried in parallel ──────────────

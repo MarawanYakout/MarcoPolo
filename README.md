@@ -352,11 +352,29 @@ marcopolo find "The Pragmatic Programmer" --get --out ~/my-books
 ```bash
 marcopolo find "Computer Systems" --source archive
 ```
-*Options for `--source`: `archive`, `openlibrary`, `gutenberg`, `annas`*
+*Options for `--source`: `archive`, `openlibrary`, `gutenberg`, `annas`, `github`, `googlescholar`, `duckduckgo`*
 
 **List results for a specific query without downloading:**
 ```bash
 marcopolo find "Rust Programming" --list
+```
+
+### Advanced PDF Finding
+Marcopolo now includes specialized sources that excel at finding PDFs across the broader internet:
+
+**Search GitHub repositories for committed PDFs:**
+```bash
+marcopolo find "machine learning" --source github --list
+```
+
+**Search Google Scholar for academic papers:**
+```bash
+marcopolo find "transformer networks" --source googlescholar --list
+```
+
+**Search DuckDuckGo specifically for PDF files:**
+```bash
+marcopolo find "rustlang" --source duckduckgo --list
 ```
 
 ---
