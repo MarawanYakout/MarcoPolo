@@ -5,6 +5,14 @@
 //! marcopolo scrape <URL> [OPTIONS]
 //! marcopolo find <QUERY> [OPTIONS]
 //! ```
+//!
+//! # GitHub Authentication
+//! To raise the API rate limit from 60 to 5,000 requests/hr, set one of:
+//!   export GITHUB_TOKEN=ghp_...
+//!   export MARCOPOLO_GITHUB_TOKEN=ghp_...
+//!
+//! Do NOT pass tokens via --token flags — they would be visible to all users
+//! via `ps aux` on shared systems.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -61,10 +69,6 @@ pub enum Command {
         /// Only include files whose name contains this string (case-insensitive).
         #[arg(long)]
         filter: Option<String>,
-
-        /// GitHub personal access token (raises rate limit 60 → 5 000 req/hr).
-        #[arg(long)]
-        token: Option<String>,
     },
 
     /// Search free book sources and optionally download results.
@@ -95,9 +99,5 @@ pub enum Command {
         /// Output directory for downloaded files.
         #[arg(long, short = 'o', default_value = "downloads")]
         out: PathBuf,
-
-        /// GitHub personal access token (not normally needed for find).
-        #[arg(long)]
-        token: Option<String>,
     },
 }
