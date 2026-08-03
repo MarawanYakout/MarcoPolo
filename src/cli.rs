@@ -69,6 +69,14 @@ pub enum Command {
         /// Only include files whose name contains this string (case-insensitive).
         #[arg(long)]
         filter: Option<String>,
+
+        /// GitHub personal access token (raises rate limit to 5,000 req/hr).
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Suppress all output except errors (useful for scripting).
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
     },
 
     /// Search free book sources and optionally download results.
@@ -99,5 +107,13 @@ pub enum Command {
         /// Output directory for downloaded files.
         #[arg(long, short = 'o', default_value = "downloads")]
         out: PathBuf,
+
+        /// GitHub personal access token (raises rate limit to 5,000 req/hr).
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Suppress all output except errors (useful for scripting).
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
     },
 }
