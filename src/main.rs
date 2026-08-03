@@ -72,13 +72,14 @@ impl FileKind {
 }
 
 /// Flattens a slice of `FileKind` into a deduplicated list of extension strings.
+/// Uses a HashSet to correctly remove duplicates regardless of ordering.
 pub fn all_extensions(kinds: &[FileKind]) -> Vec<&'static str> {
-    let mut exts: Vec<&'static str> = kinds
+    let mut seen = std::collections::HashSet::new();
+    kinds
         .iter()
         .flat_map(|k| k.extensions().iter().copied())
-        .collect();
-    exts.dedup();
-    exts
+        .filter(|e| seen.insert(*e))
+        .collect()
 }
 
 /// Returns `true` if `path` (or a URL) ends with one of the supplied extensions.
@@ -139,7 +140,11 @@ struct ReleaseAsset {
 // URL parsing
 // =============================================================================
 
-fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>)> {
+/// Parses a GitHub URL and returns (owner, repo, subpath, branch_from_url).
+/// When the URL contains a `/tree/<branch>/...` segment the branch name is
+/// returned so callers can avoid an extra API round-trip to fetch the default
+/// branch.
+fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option<String>)> {
     let no_query = raw.split('?').next().unwrap_or(raw);
     let no_frag  = no_query.split('#').next().unwrap_or(no_query);
     let parsed: Url = Url::parse(no_frag)?;
@@ -155,13 +160,23 @@ fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>)> {
 
     let owner = segs[0].to_owned();
     let repo  = segs[1].to_owned();
+
+    // Extract branch and subpath from tree URLs:
+    //   github.com/owner/repo/tree/<branch>[/<subpath...>]
+    //   segs: [0]=owner [1]=repo [2]=tree [3]=branch [4..]=subpath
+    let branch_from_url = if segs.len() > 3 && segs[2] == "tree" {
+        Some(segs[3].to_owned())
+    } else {
+        None
+    };
+
     let subpath = if segs.len() > 4 && segs[2] == "tree" {
         Some(segs[4..].join("/"))
     } else {
         None
     };
 
-    Ok((owner, repo, subpath))
+    Ok((owner, repo, subpath, branch_from_url))
 }
 
 // =============================================================================
@@ -353,17 +368,11 @@ async fn download_file_full(
 ) -> Result<()> {
     let dest = dir.join(&src.name);
 
-    let existing_size: u64 = if dest.exists() {
-        let size = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
-        if resume && size > 0 {
-            size
-        } else if !resume {
-            pb.set_message(format!("{} {}", "skip".dimmed(), src.name.dimmed()));
-            pb.inc(1);
-            return Ok(());
-        } else {
-            0
-        }
+    // When resume=true: send a Range header to continue a partial download.
+    // When resume=false (default): always re-download from scratch, even if
+    // the file already exists — overwrite it.
+    let existing_size: u64 = if dest.exists() && resume {
+        tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
@@ -547,7 +556,7 @@ async fn run() -> Result<()> {
             );
 
             let mut all: Vec<FileSource> = if url.contains("github.com") {
-                let (owner, repo, subpath) = parse_github_url(&url)?;
+                let (owner, repo, subpath, branch_from_url) = parse_github_url(&url)?;
 
                 if let Some(ref sp) = subpath {
                     println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
@@ -555,8 +564,13 @@ async fn run() -> Result<()> {
 
                 println!("{} scanning repo tree, README, and releases …", "→".dimmed());
 
-                let branch = default_branch(&client, &owner, &repo).await?;
-                let sp     = subpath.as_deref();
+                // Use the branch encoded in the URL when present; only fall
+                // back to a GitHub API call when no branch was specified.
+                let branch = match branch_from_url {
+                    Some(b) => b,
+                    None    => default_branch(&client, &owner, &repo).await?,
+                };
+                let sp = subpath.as_deref();
 
                 let (tree_r, readme_r, releases_r) = tokio::join!(
                     repo_files(&client, &owner, &repo, &branch, &exts, sp),

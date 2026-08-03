@@ -1,4 +1,4 @@
-//! Generic web scraper for marcopolo v0.//! Generic web scraper for marcopolo v0.3
+//! Generic web scraper for marcopolo v0.3
 //!
 //! Strategy:
 //!   1. Check `/sitemap.xml` at the root domain — fast discovery path.
