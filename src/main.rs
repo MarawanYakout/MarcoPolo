@@ -15,8 +15,10 @@ mod web_scraper;
 // ── Standard library ──────────────────────────────────────────────────────────
 use std::{
     collections::HashSet,
+    fmt::Write as FmtWrite,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -137,13 +139,62 @@ struct ReleaseAsset {
 }
 
 // =============================================================================
+// Log entry
+// =============================================================================
+
+/// A single record written to marcopolo.log after each download attempt.
+#[derive(Debug)]
+struct LogEntry {
+    timestamp: String,
+    filename:  String,
+    url:       String,
+    status:    String, // "ok" | "error: <msg>"
+}
+
+impl LogEntry {
+    fn format(&self) -> String {
+        format!(
+            "[{}] {}  {}  {}\n",
+            self.timestamp, self.status, self.filename, self.url
+        )
+    }
+}
+
+/// Returns the current UTC time formatted as `YYYY-MM-DD HH:MM:SS`.
+fn utc_now() -> String {
+    // std::time gives us seconds since epoch; format manually to avoid
+    // pulling in the `chrono` crate.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (s, m, h) = (secs % 60, (secs / 60) % 60, (secs / 3600) % 24);
+    let days      = secs / 86400; // days since 1970-01-01
+    // Quick Gregorian approximation (good enough for log timestamps)
+    let (mut y, mut rem) = (1970u32, days);
+    loop {
+        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if rem < dy { break; }
+        rem -= dy;
+        y   += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in = [31u32,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];
+    let (mut mo, mut d) = (1u32, rem + 1);
+    for dim in &days_in {
+        if d <= *dim { break; }
+        d  -= dim;
+        mo += 1;
+    }
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+// =============================================================================
 // URL parsing
 // =============================================================================
 
 /// Parses a GitHub URL and returns (owner, repo, subpath, branch_from_url).
-/// When the URL contains a `/tree/<branch>/...` segment the branch name is
-/// returned so callers can avoid an extra API round-trip to fetch the default
-/// branch.
 fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option<String>)> {
     let no_query = raw.split('?').next().unwrap_or(raw);
     let no_frag  = no_query.split('#').next().unwrap_or(no_query);
@@ -161,9 +212,6 @@ fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option
     let owner = segs[0].to_owned();
     let repo  = segs[1].to_owned();
 
-    // Extract branch and subpath from tree URLs:
-    //   github.com/owner/repo/tree/<branch>[/<subpath...>]
-    //   segs: [0]=owner [1]=repo [2]=tree [3]=branch [4..]=subpath
     let branch_from_url = if segs.len() > 3 && segs[2] == "tree" {
         Some(segs[3].to_owned())
     } else {
@@ -365,12 +413,13 @@ async fn download_file_full(
     resume:   bool,
     delay_ms: Option<u64>,
     retries:  u32,
+    quiet:    bool,
+    log:      &Arc<Mutex<Vec<LogEntry>>>,
 ) -> Result<()> {
     let dest = dir.join(&src.name);
 
-    // When resume=true: send a Range header to continue a partial download.
-    // When resume=false (default): always re-download from scratch, even if
-    // the file already exists — overwrite it.
+    // resume=true  → send Range header to continue a partial file
+    // resume=false → always re-download from scratch (overwrite)
     let existing_size: u64 = if dest.exists() && resume {
         tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0)
     } else {
@@ -381,7 +430,9 @@ async fn download_file_full(
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
-    pb.set_message(format!("{} {}", "↓".cyan(), src.name));
+    if !quiet {
+        pb.set_message(format!("{} {}", "↓".cyan(), src.name));
+    }
 
     let mut last_err: Option<Box<dyn std::error::Error>> = None;
 
@@ -401,8 +452,16 @@ async fn download_file_full(
         };
 
         if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            pb.set_message(format!("{} {}", "complete".dimmed(), src.name.dimmed()));
+            if !quiet {
+                pb.set_message(format!("{} {}", "complete".dimmed(), src.name.dimmed()));
+            }
             pb.inc(1);
+            log.lock().unwrap().push(LogEntry {
+                timestamp: utc_now(),
+                filename:  src.name.clone(),
+                url:       src.url.clone(),
+                status:    "ok (already complete)".into(),
+            });
             return Ok(());
         }
 
@@ -412,6 +471,13 @@ async fn download_file_full(
             Ok(r)  => r,
             Err(e) => {
                 if e.status().map(|s| s.is_client_error()).unwrap_or(false) {
+                    let msg = format!("{e}");
+                    log.lock().unwrap().push(LogEntry {
+                        timestamp: utc_now(),
+                        filename:  src.name.clone(),
+                        url:       src.url.clone(),
+                        status:    format!("error: {msg}"),
+                    });
                     return Err(e.into());
                 }
                 last_err = Some(e.into());
@@ -433,59 +499,79 @@ async fn download_file_full(
         }
 
         pb.inc(1);
+        log.lock().unwrap().push(LogEntry {
+            timestamp: utc_now(),
+            filename:  src.name.clone(),
+            url:       src.url.clone(),
+            status:    "ok".into(),
+        });
         return Ok(());
     }
 
+    let err_msg = last_err
+        .as_ref()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "download failed after all retries".into());
+
+    log.lock().unwrap().push(LogEntry {
+        timestamp: utc_now(),
+        filename:  src.name.clone(),
+        url:       src.url.clone(),
+        status:    format!("error: {err_msg}"),
+    });
+
     Err(last_err.unwrap_or_else(|| "download failed after all retries".into()))
+}
+
+/// Flush all log entries to `<out>/marcopolo.log`, appending to any existing file.
+async fn write_log(out: &Path, entries: &[LogEntry]) -> Result<()> {
+    if entries.is_empty() { return Ok(()); }
+    let path = out.join("marcopolo.log");
+    let mut content = String::new();
+    for e in entries {
+        let _ = FmtWrite::write_str(&mut content, &e.format());
+    }
+    // Append so multiple runs accumulate history
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await?;
+    file.write_all(content.as_bytes()).await?;
+    Ok(())
 }
 
 // =============================================================================
 // Interactive selection helper
 // =============================================================================
 
-/// Parse a user's selection string into a set of 0-based indices.
-///
-/// Accepts:
-/// - `"a"` or `"all"` → selects every index in `0..count`
-/// - `"1 3 5"` / `"1,3,5"` / `"1-3"` → specific numbers (1-based) or inclusive ranges
-///
-/// Invalid tokens are silently skipped.  Returns an empty `Vec` if nothing
-/// valid was entered (the caller should re-prompt).
 fn parse_selection(input: &str, count: usize) -> Vec<usize> {
     let trimmed = input.trim().to_lowercase();
     if trimmed == "a" || trimmed == "all" {
         return (0..count).collect();
     }
 
-    // Normalise separators: commas and whitespace → space
     let normalised = trimmed.replace(',', " ");
     let mut indices = Vec::new();
 
     for token in normalised.split_whitespace() {
-        // Range token: "2-5"
         if let Some((lo, hi)) = token.split_once('-') {
             if let (Ok(a), Ok(b)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
                 for n in a..=b {
-                    if n >= 1 && n <= count {
-                        indices.push(n - 1);
-                    }
+                    if n >= 1 && n <= count { indices.push(n - 1); }
                 }
             }
-        // Single number
         } else if let Ok(n) = token.parse::<usize>() {
-            if n >= 1 && n <= count {
-                indices.push(n - 1);
-            }
+            if n >= 1 && n <= count { indices.push(n - 1); }
         }
     }
 
-    // Deduplicate while preserving order
     let mut seen = HashSet::new();
     indices.retain(|i| seen.insert(*i));
     indices
 }
 
-/// Block on a single line of stdin.  Returns an empty string on EOF.
 fn read_line_stdin() -> String {
     let mut buf = String::new();
     let _ = io::stdin().read_line(&mut buf);
@@ -518,7 +604,6 @@ async fn run() -> Result<()> {
     }
     let cli = Cli::parse_from(args);
 
-    // ── Build HTTP client ──────────────────────────────────────────────────────
     let build_client = |token: Option<&str>| -> Result<Client> {
         let mut default_headers = header::HeaderMap::new();
         default_headers.insert(
@@ -539,33 +624,33 @@ async fn run() -> Result<()> {
 
     match cli.command {
         // ── scrape subcommand ──────────────────────────────────────────────────
-        Command::Scrape { url, kinds, out, depth, delay, resume, retries, list, filter, token } => {
+        Command::Scrape { url, kinds, out, depth, delay, resume, retries, list, filter, token, quiet } => {
             let client = build_client(token.as_deref())?;
             let exts   = all_extensions(&kinds);
 
-            let kinds_label = kinds.iter()
-                .map(|k| k.label().cyan().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            println!(
-                "{} {}  [{}]",
-                "🧭 marcopolo scrape →".cyan().bold(),
-                url.yellow().bold(),
-                kinds_label,
-            );
+            if !quiet {
+                let kinds_label = kinds.iter()
+                    .map(|k| k.label().cyan().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{} {}  [{}]",
+                    "🧭 marcopolo scrape →".cyan().bold(),
+                    url.yellow().bold(),
+                    kinds_label,
+                );
+            }
 
             let mut all: Vec<FileSource> = if url.contains("github.com") {
                 let (owner, repo, subpath, branch_from_url) = parse_github_url(&url)?;
 
-                if let Some(ref sp) = subpath {
-                    println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
+                if !quiet {
+                    if let Some(ref sp) = subpath {
+                        println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
+                    }
+                    println!("{} scanning repo tree, README, and releases …", "→".dimmed());
                 }
 
-                println!("{} scanning repo tree, README, and releases …", "→".dimmed());
-
-                // Use the branch encoded in the URL when present; only fall
-                // back to a GitHub API call when no branch was specified.
                 let branch = match branch_from_url {
                     Some(b) => b,
                     None    => default_branch(&client, &owner, &repo).await?,
@@ -589,33 +674,39 @@ async fn run() -> Result<()> {
                 }
                 files
             } else {
-                println!(
-                    "{} scanning web page (depth: {}) …",
-                    "→".dimmed(),
-                    depth.to_string().cyan(),
-                );
+                if !quiet {
+                    println!(
+                        "{} scanning web page (depth: {}) …",
+                        "→".dimmed(),
+                        depth.to_string().cyan(),
+                    );
+                }
                 web_scraper::scrape_files(&client, &url, depth, &exts).await?
             };
 
             if let Some(ref kw) = filter {
                 let kw_lower = kw.to_lowercase();
                 all.retain(|f| f.name.to_lowercase().contains(&kw_lower));
-                println!(
-                    "{} filter \"{}\" → {} match(es)",
-                    "→".dimmed(), kw.cyan(), all.len().to_string().green(),
-                );
+                if !quiet {
+                    println!(
+                        "{} filter \"{}\" → {} match(es)",
+                        "→".dimmed(), kw.cyan(), all.len().to_string().green(),
+                    );
+                }
             }
 
             if all.is_empty() {
-                println!("{}", "No files found.".yellow());
+                if !quiet { println!("{}", "No files found.".yellow()); }
                 return Ok(());
             }
 
-            println!(
-                "{} {} file(s) discovered",
-                "✓".green().bold(),
-                all.len().to_string().green().bold(),
-            );
+            if !quiet {
+                println!(
+                    "{} {} file(s) discovered",
+                    "✓".green().bold(),
+                    all.len().to_string().green().bold(),
+                );
+            }
 
             if list {
                 println!("\n{}", "Discovered files:".cyan().bold());
@@ -632,17 +723,32 @@ async fn run() -> Result<()> {
 
             tokio::fs::create_dir_all(&out).await?;
 
-            let pb = ProgressBar::new(all.len() as u64);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.cyan} [{bar:45.cyan/blue}] {pos}/{len}  {msg}",
-                )
-                .unwrap()
-                .progress_chars("█▓░"),
-            );
+            // ── Progress bar: bytes/sec + ETA + file count ────────────────────
+            // indicatif tokens used:
+            //   {bytes_per_sec} — rolling download throughput
+            //   {eta}           — estimated time to completion
+            //   {pos}/{len}     — files done / total
+            //   {msg}           — current filename
+            let pb = if quiet {
+                ProgressBar::hidden()
+            } else {
+                let b = ProgressBar::new(all.len() as u64);
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {bytes_per_sec}  ETA {eta}  {msg}",
+                    )
+                    .unwrap()
+                    .progress_chars("█▓░"),
+                );
+                b
+            };
+
+            let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
             stream::iter(all.iter())
-                .map(|src| download_file_full(&client, src, &out, &pb, resume, delay, retries))
+                .map(|src| download_file_full(
+                    &client, src, &out, &pb, resume, delay, retries, quiet, &log,
+                ))
                 .buffer_unordered(4)
                 .collect::<Vec<_>>()
                 .await
@@ -651,16 +757,32 @@ async fn run() -> Result<()> {
                     if let Err(e) = r { eprintln!("{} {e}", "download error:".red()); }
                 });
 
-            pb.finish_with_message("done ✓");
-            println!(
-                "\n{} all files saved to {}",
-                "✓".green().bold(),
-                out.display().to_string().cyan().bold(),
-            );
+            if !quiet { pb.finish_with_message("done ✓"); }
+
+            // ── Write download log ────────────────────────────────────────────
+            let entries = log.lock().unwrap();
+            if let Err(e) = write_log(&out, &entries).await {
+                eprintln!("{} could not write log: {e}", "warning:".yellow());
+            } else if !quiet && !entries.is_empty() {
+                println!(
+                    "{} log written → {}",
+                    "✓".green(),
+                    out.join("marcopolo.log").display().to_string().cyan(),
+                );
+            }
+            drop(entries);
+
+            if !quiet {
+                println!(
+                    "{} all files saved to {}",
+                    "✓".green().bold(),
+                    out.display().to_string().cyan().bold(),
+                );
+            }
         }
 
         // ── find subcommand ────────────────────────────────────────────────────
-        Command::Find { query, list, get, source, out, token } => {
+        Command::Find { query, list, get, source, out, token, quiet } => {
             let client = build_client(token.as_deref())?;
 
             if !utils::validation::is_valid_query(&query) {
@@ -668,88 +790,75 @@ async fn run() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let sources_label = if let Some(s) = &source {
-                format!("[{}]", s)
+            if !quiet {
+                let sources_label = if let Some(s) = &source {
+                    format!("[{}]", s)
+                } else {
+                    "[archive.org · openlibrary · gutenberg · anna's archive · github · googlescholar · duckduckgo]".to_string()
+                };
+                println!(
+                    "{} \"{}\"  {}",
+                    "🔍 marcopolo find →".cyan().bold(),
+                    query.yellow().bold(),
+                    sources_label,
+                );
+            }
+
+            let pb_spin = if quiet {
+                ProgressBar::hidden()
             } else {
-                "[archive.org · openlibrary · gutenberg · anna's archive · github · googlescholar · duckduckgo]".to_string()
+                let b = ProgressBar::new_spinner();
+                b.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.cyan} {msg}")
+                        .unwrap(),
+                );
+                b.set_message("Searching all sources …");
+                b.enable_steady_tick(std::time::Duration::from_millis(80));
+                b
             };
 
-            println!(
-                "{} \"{}\"  {}",
-                "🔍 marcopolo find →".cyan().bold(),
-                query.yellow().bold(),
-                sources_label,
-            );
-
-            // ── Spinner while all sources are queried in parallel ──────────────
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.cyan} {msg}")
-                    .unwrap(),
-            );
-            pb.set_message("Searching all sources …");
-            pb.enable_steady_tick(std::time::Duration::from_millis(80));
-
             let results = find::search_all(&client, &query, source).await;
-
-            pb.finish_and_clear();
+            pb_spin.finish_and_clear();
 
             if results.is_empty() {
-                println!("{} No results found for \"{}\".", "✗".red(), query);
+                if !quiet { println!("{} No results found for \"{}\".", "✗".red(), query); }
                 return Ok(());
             }
 
-            // ── Numbered result list ───────────────────────────────────────────
-            //
-            // Format:
-            //   1. (archive.org)      Clean Code.pdf
-            //      https://archive.org/download/…
-            //
-            println!(
-                "\n{} {} result(s) for \"{}\":\n",
-                "✓".green().bold(),
-                results.len().to_string().green().bold(),
-                query.yellow(),
-            );
-
-            for (i, r) in results.iter().enumerate() {
-                let fmt_tag = r.format
-                    .as_deref()
-                    .map(|f| format!(" [{}]", f.to_uppercase()))
-                    .unwrap_or_default();
-
+            if !quiet {
                 println!(
-                    "  {}. ({})  {}{}",
-                    format!("{:>2}", i + 1).bold(),
-                    r.source.yellow(),
-                    r.title.green(),
-                    fmt_tag.cyan(),
+                    "\n{} {} result(s) for \"{}\":\n",
+                    "✓".green().bold(),
+                    results.len().to_string().green().bold(),
+                    query.yellow(),
                 );
-                println!("      {}", r.url.dimmed());
-                println!();
+                for (i, r) in results.iter().enumerate() {
+                    let fmt_tag = r.format
+                        .as_deref()
+                        .map(|f| format!(" [{}]", f.to_uppercase()))
+                        .unwrap_or_default();
+                    println!(
+                        "  {}. ({})  {}{}",
+                        format!("{:>2}", i + 1).bold(),
+                        r.source.yellow(),
+                        r.title.green(),
+                        fmt_tag.cyan(),
+                    );
+                    println!("      {}", r.url.dimmed());
+                    println!();
+                }
             }
 
-            // ── --list: print only, no prompt ──────────────────────────────────
-            if list {
-                return Ok(());
-            }
+            if list { return Ok(()); }
 
-            // ── --get: skip prompt, download everything ────────────────────────
             let chosen: Vec<usize> = if get {
                 (0..results.len()).collect()
+            } else if quiet {
+                // In quiet mode without --get there is nothing to select interactively;
+                // just download everything.
+                (0..results.len()).collect()
             } else {
-                // ── Interactive selection prompt ───────────────────────────────
-                //
-                // Accepts:
-                //   "1"        → download result 1
-                //   "1 3"      → download results 1 and 3
-                //   "1,3,5"    → same with comma separators
-                //   "1-4"      → inclusive range
-                //   "a" / "all"→ download everything
-                //   "q"        → quit without downloading
-                //
-                // Re-prompts once on invalid input.
                 println!(
                     "{}",
                     "──────────────────────────────────────────────".dimmed(),
@@ -772,25 +881,17 @@ async fn run() -> Result<()> {
 
                 let mut selection = Vec::new();
                 let mut attempts  = 0usize;
-
                 loop {
                     print!("{} ", "→".cyan().bold());
                     io::stdout().flush().ok();
-
-                    let raw = read_line_stdin();
+                    let raw     = read_line_stdin();
                     let trimmed = raw.trim().to_lowercase();
-
                     if trimmed == "q" || trimmed == "quit" || trimmed.is_empty() {
                         println!("{} nothing downloaded.", "✗".dimmed());
                         return Ok(());
                     }
-
                     selection = parse_selection(&trimmed, results.len());
-
-                    if !selection.is_empty() {
-                        break;
-                    }
-
+                    if !selection.is_empty() { break; }
                     attempts += 1;
                     if attempts >= 3 {
                         println!("{} no valid selection — aborting.", "✗".red());
@@ -798,62 +899,73 @@ async fn run() -> Result<()> {
                     }
                     eprintln!(
                         "{} unrecognised input — enter a number (e.g. {}) or {} for all",
-                        "!".yellow().bold(),
-                        "1".cyan(),
-                        "a".green(),
+                        "!".yellow().bold(), "1".cyan(), "a".green(),
                     );
                 }
-
                 selection
             };
 
-            if chosen.is_empty() {
-                return Ok(());
-            }
+            if chosen.is_empty() { return Ok(()); }
 
-            // ── Download selected results ──────────────────────────────────────
             tokio::fs::create_dir_all(&out).await?;
 
-            println!(
-                "\n{} downloading {} file(s) → {}",
-                "↓".cyan().bold(),
-                chosen.len(),
-                out.display().to_string().cyan(),
-            );
+            if !quiet {
+                println!(
+                    "\n{} downloading {} file(s) → {}",
+                    "↓".cyan().bold(),
+                    chosen.len(),
+                    out.display().to_string().cyan(),
+                );
+            }
 
-            let pb_dl = ProgressBar::new(chosen.len() as u64);
-            pb_dl.set_style(
-                ProgressStyle::with_template(
-                    "  {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {msg}"
-                )
-                .unwrap()
-                .progress_chars("█▓░"),
-            );
+            // ── Progress bar with throughput + ETA ────────────────────────────
+            let pb_dl = if quiet {
+                ProgressBar::hidden()
+            } else {
+                let b = ProgressBar::new(chosen.len() as u64);
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {bytes_per_sec}  ETA {eta}  {msg}"
+                    )
+                    .unwrap()
+                    .progress_chars("█▓░"),
+                );
+                b
+            };
 
+            let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
             let mut errors: Vec<String> = Vec::new();
 
             for idx in &chosen {
                 let r    = &results[*idx];
                 let dest = out.join(&r.filename);
-                pb_dl.set_message(format!("{}", r.filename.dimmed()));
+                if !quiet { pb_dl.set_message(format!("{}", r.filename.dimmed())); }
 
                 match download_file(&client, &r.url, &dest).await {
                     Ok(()) => {
-                        pb_dl.println(format!(
-                            "  {} ({})  {}",
-                            "✓".green().bold(),
-                            r.source.yellow(),
-                            r.filename,
-                        ));
+                        if !quiet {
+                            pb_dl.println(format!(
+                                "  {} ({})  {}",
+                                "✓".green().bold(), r.source.yellow(), r.filename,
+                            ));
+                        }
+                        log.lock().unwrap().push(LogEntry {
+                            timestamp: utc_now(),
+                            filename:  r.filename.clone(),
+                            url:       r.url.clone(),
+                            status:    "ok".into(),
+                        });
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "  {} ({})  {}:  {e}",
-                            "✗".red().bold(),
-                            r.source.yellow(),
-                            r.filename,
-                        );
-                        pb_dl.println(msg.clone());
+                        let msg = format!("  {} ({})  {}:  {e}",
+                            "✗".red().bold(), r.source.yellow(), r.filename);
+                        if !quiet { pb_dl.println(msg.clone()); }
+                        log.lock().unwrap().push(LogEntry {
+                            timestamp: utc_now(),
+                            filename:  r.filename.clone(),
+                            url:       r.url.clone(),
+                            status:    format!("error: {e}"),
+                        });
                         errors.push(msg);
                     }
                 }
@@ -862,21 +974,36 @@ async fn run() -> Result<()> {
 
             pb_dl.finish_and_clear();
 
-            let ok_count = chosen.len() - errors.len();
-            if ok_count > 0 {
+            // ── Write log ─────────────────────────────────────────────────────
+            let entries = log.lock().unwrap();
+            if let Err(e) = write_log(&out, &entries).await {
+                eprintln!("{} could not write log: {e}", "warning:".yellow());
+            } else if !quiet && !entries.is_empty() {
                 println!(
-                    "\n{} {} file(s) saved to {}",
-                    "✓".green().bold(),
-                    ok_count.to_string().green().bold(),
-                    out.display().to_string().cyan().bold(),
+                    "{} log written → {}",
+                    "✓".green(),
+                    out.join("marcopolo.log").display().to_string().cyan(),
                 );
             }
-            if !errors.is_empty() {
-                println!(
-                    "{} {} download(s) failed.",
-                    "✗".red().bold(),
-                    errors.len().to_string().red(),
-                );
+            drop(entries);
+
+            let ok_count = chosen.len() - errors.len();
+            if !quiet {
+                if ok_count > 0 {
+                    println!(
+                        "\n{} {} file(s) saved to {}",
+                        "✓".green().bold(),
+                        ok_count.to_string().green().bold(),
+                        out.display().to_string().cyan().bold(),
+                    );
+                }
+                if !errors.is_empty() {
+                    println!(
+                        "{} {} download(s) failed.",
+                        "✗".red().bold(),
+                        errors.len().to_string().red(),
+                    );
+                }
             }
         }
     }
@@ -893,61 +1020,35 @@ mod tests {
     use super::parse_selection;
 
     #[test]
-    fn select_single() {
-        assert_eq!(parse_selection("1", 5), vec![0]);
-    }
+    fn select_single() { assert_eq!(parse_selection("1", 5), vec![0]); }
 
     #[test]
-    fn select_multiple_space() {
-        assert_eq!(parse_selection("1 3 5", 5), vec![0, 2, 4]);
-    }
+    fn select_multiple_space() { assert_eq!(parse_selection("1 3 5", 5), vec![0, 2, 4]); }
 
     #[test]
-    fn select_multiple_comma() {
-        assert_eq!(parse_selection("2,4", 5), vec![1, 3]);
-    }
+    fn select_multiple_comma() { assert_eq!(parse_selection("2,4", 5), vec![1, 3]); }
 
     #[test]
-    fn select_range() {
-        assert_eq!(parse_selection("1-3", 5), vec![0, 1, 2]);
-    }
+    fn select_range() { assert_eq!(parse_selection("1-3", 5), vec![0, 1, 2]); }
 
     #[test]
-    fn select_all_a() {
-        assert_eq!(parse_selection("a", 3), vec![0, 1, 2]);
-    }
+    fn select_all_a() { assert_eq!(parse_selection("a", 3), vec![0, 1, 2]); }
 
     #[test]
-    fn select_all_word() {
-        assert_eq!(parse_selection("all", 3), vec![0, 1, 2]);
-    }
+    fn select_all_word() { assert_eq!(parse_selection("all", 3), vec![0, 1, 2]); }
 
     #[test]
-    fn select_out_of_range_ignored() {
-        // 6 is beyond count=5 → ignored
-        assert_eq!(parse_selection("1 6", 5), vec![0]);
-    }
+    fn select_out_of_range_ignored() { assert_eq!(parse_selection("1 6", 5), vec![0]); }
 
     #[test]
-    fn select_zero_ignored() {
-        // 0 is not a valid 1-based index
-        assert_eq!(parse_selection("0 1", 5), vec![0]);
-    }
+    fn select_zero_ignored() { assert_eq!(parse_selection("0 1", 5), vec![0]); }
 
     #[test]
-    fn select_deduplication() {
-        // "1 1 2" → [0, 1]
-        assert_eq!(parse_selection("1 1 2", 5), vec![0, 1]);
-    }
+    fn select_deduplication() { assert_eq!(parse_selection("1 1 2", 5), vec![0, 1]); }
 
     #[test]
-    fn select_invalid_returns_empty() {
-        assert!(parse_selection("foo bar", 5).is_empty());
-    }
+    fn select_invalid_returns_empty() { assert!(parse_selection("foo bar", 5).is_empty()); }
 
     #[test]
-    fn select_q_returns_empty() {
-        // "q" is handled before parse_selection is called; it's not a valid token
-        assert!(parse_selection("q", 5).is_empty());
-    }
+    fn select_q_returns_empty() { assert!(parse_selection("q", 5).is_empty()); }
 }
