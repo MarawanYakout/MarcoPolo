@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 /// 🧭 Hunt and download files from GitHub repos, websites, or free book sources.
 #[derive(Parser, Debug)]
-#[command(name = "marcopolo", version = "0.4.0", about = "Multi-source file hunter & downloader")]
+#[command(name = "marcopolo", version, about = "Multi-source file hunter & downloader")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -50,17 +50,21 @@ pub enum Command {
         #[arg(long, default_value_t = 1)]
         depth: usize,
 
-        /// Milliseconds of delay between each download request.
+        /// Minimum milliseconds between download requests (across all parallel jobs).
         #[arg(long)]
         delay: Option<u64>,
 
-        /// Append to partially downloaded files instead of re-downloading.
+        /// Resume partial (.part) downloads and skip files already downloaded.
         #[arg(long = "continue", default_value_t = false)]
         resume: bool,
 
         /// Retry attempts per file before giving up.
         #[arg(long, default_value_t = 3)]
         retries: u32,
+
+        /// Number of files to download in parallel.
+        #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
+        jobs: u16,
 
         /// List files without downloading (dry run).
         #[arg(long, default_value_t = false)]
@@ -69,10 +73,6 @@ pub enum Command {
         /// Only include files whose name contains this string (case-insensitive).
         #[arg(long)]
         filter: Option<String>,
-
-        /// GitHub personal access token (raises rate limit to 5,000 req/hr).
-        #[arg(long)]
-        token: Option<String>,
 
         /// Suppress all output except errors (useful for scripting).
         #[arg(long, default_value_t = false)]
@@ -104,13 +104,17 @@ pub enum Command {
         #[arg(long, value_enum, value_name = "SOURCE")]
         source: Option<crate::utils::validation::Source>,
 
+        /// Only keep results in this format.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        format: Option<crate::utils::validation::SupportedExtension>,
+
         /// Output directory for downloaded files.
         #[arg(long, short = 'o', default_value = "downloads")]
         out: PathBuf,
 
-        /// GitHub personal access token (raises rate limit to 5,000 req/hr).
-        #[arg(long)]
-        token: Option<String>,
+        /// Number of files to download in parallel.
+        #[arg(long, short = 'j', default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
+        jobs: u16,
 
         /// Suppress all output except errors (useful for scripting).
         #[arg(long, default_value_t = false)]

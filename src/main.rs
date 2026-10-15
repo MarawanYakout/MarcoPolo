@@ -1,13 +1,15 @@
-//! marcopolo v0.4 — multi-type file hunter & downloader + free-book search engine
+//! marcopolo — multi-type file hunter & downloader + free-book search engine
 //!
 //! # Subcommands
 //! ```text
 //! marcopolo scrape <URL> [OPTIONS]   — crawl a GitHub repo or any website
 //! marcopolo find   <QUERY> [OPTIONS] — search Archive.org, Open Library,
-//!                                      Gutenberg, and Anna's Archive
+//!                                      Gutenberg, Anna's Archive, GitHub,
+//!                                      Google Scholar, and DuckDuckGo
 //! ```
 
 mod cli;
+mod download;
 mod find;
 mod utils;
 mod web_scraper;
@@ -15,10 +17,9 @@ mod web_scraper;
 // ── Standard library ──────────────────────────────────────────────────────────
 use std::{
     collections::HashSet,
-    fmt::Write as FmtWrite,
     io::{self, Write},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::Path,
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -26,12 +27,14 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
-use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::{header, Client};
 use serde::Deserialize;
 use url::Url;
+
+use download::{download_all, DownloadOpts};
+use utils::parsing::{encode_path, filename_from_url, safe_filename, unique_filename};
 
 // ── Error alias ───────────────────────────────────────────────────────────────
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -87,7 +90,7 @@ pub fn all_extensions(kinds: &[FileKind]) -> Vec<&'static str> {
 /// Returns `true` if `path` (or a URL) ends with one of the supplied extensions.
 pub fn matches_ext(path: &str, exts: &[&str]) -> bool {
     let lower = path.to_lowercase();
-    let clean = lower.split('?').next().unwrap_or(&lower);
+    let clean = lower.split(['?', '#']).next().unwrap_or(&lower);
     exts.iter().any(|e| clean.ends_with(&format!(".{e}")))
 }
 
@@ -139,60 +142,17 @@ struct ReleaseAsset {
 }
 
 // =============================================================================
-// Log entry
-// =============================================================================
-
-/// A single record written to marcopolo.log after each download attempt.
-#[derive(Debug)]
-struct LogEntry {
-    timestamp: String,
-    filename:  String,
-    url:       String,
-    status:    String, // "ok" | "error: <msg>"
-}
-
-impl LogEntry {
-    fn format(&self) -> String {
-        format!(
-            "[{}] {}  {}  {}\n",
-            self.timestamp, self.status, self.filename, self.url
-        )
-    }
-}
-
-/// Returns the current UTC time formatted as `YYYY-MM-DD HH:MM:SS`.
-fn utc_now() -> String {
-    // std::time gives us seconds since epoch; format manually to avoid
-    // pulling in the `chrono` crate.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (s, m, h) = (secs % 60, (secs / 60) % 60, (secs / 3600) % 24);
-    let days      = secs / 86400; // days since 1970-01-01
-    // Quick Gregorian approximation (good enough for log timestamps)
-    let (mut y, mut rem) = (1970u32, days);
-    loop {
-        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if rem < dy { break; }
-        rem -= dy;
-        y   += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let days_in = [31u64,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];
-    let (mut mo, mut d) = (1u32, rem + 1);
-    for dim in &days_in {
-        if d <= *dim { break; }
-        d  -= dim;
-        mo += 1;
-    }
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
-}
-
-// =============================================================================
 // URL parsing
 // =============================================================================
+
+/// `true` only when the URL's host really is GitHub — a substring check would
+/// also match `https://example.com/?ref=github.com`.
+fn is_github_url(raw: &str) -> bool {
+    Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h == "github.com" || h == "www.github.com"))
+        .unwrap_or(false)
+}
 
 /// Parses a GitHub URL and returns (owner, repo, subpath, branch_from_url).
 fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option<String>)> {
@@ -210,7 +170,7 @@ fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option
     }
 
     let owner = segs[0].to_owned();
-    let repo  = segs[1].to_owned();
+    let repo  = segs[1].strip_suffix(".git").unwrap_or(segs[1]).to_owned();
 
     let branch_from_url = if segs.len() > 3 && segs[2] == "tree" {
         Some(segs[3].to_owned())
@@ -231,12 +191,23 @@ fn parse_github_url(raw: &str) -> Result<(String, String, Option<String>, Option
 // GitHub API helpers
 // =============================================================================
 
+/// GitHub answers 403/429 when the unauthenticated limit (60 req/hr) is used
+/// up; say how to fix it instead of showing a bare status code.
+fn github_error(e: reqwest::Error) -> Box<dyn std::error::Error> {
+    match e.status().map(|s| s.as_u16()) {
+        Some(403 | 429) => format!(
+            "{e} — likely the GitHub API rate limit; set GITHUB_TOKEN to raise it to 5,000 req/hr"
+        ).into(),
+        _ => e.into(),
+    }
+}
+
 async fn default_branch(client: &Client, owner: &str, repo: &str) -> Result<String> {
     let url  = format!("https://api.github.com/repos/{owner}/{repo}");
     let info: RepoInfo = client
         .get(&url)
         .send().await?
-        .error_for_status()?
+        .error_for_status().map_err(github_error)?
         .json().await?;
     Ok(info.default_branch)
 }
@@ -269,13 +240,14 @@ async fn repo_files(
     exts:    &[&str],
     subpath: Option<&str>,
 ) -> Result<Vec<FileSource>> {
+    let branch = encode_path(branch);
     let url  = format!(
         "https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     );
     let tree: GitTree = client
         .get(&url)
         .send().await?
-        .error_for_status()?
+        .error_for_status().map_err(github_error)?
         .json().await?;
 
     if tree.truncated {
@@ -295,7 +267,7 @@ async fn repo_files(
         .map(|e| {
             let raw_url = format!(
                 "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{}",
-                e.path
+                encode_path(&e.path)
             );
             let name = Path::new(&e.path)
                 .file_name()
@@ -321,7 +293,7 @@ async fn readme_files(
         let resp = client.get(&url).send().await?;
         if resp.status() == 404 { return Ok::<String, Box<dyn std::error::Error>>(String::new()); }
 
-        let readme: ReadmeResponse = resp.error_for_status()?.json().await?;
+        let readme: ReadmeResponse = resp.error_for_status().map_err(github_error)?.json().await?;
         if readme.encoding != "base64" { return Ok(String::new()); }
 
         let bytes = B64.decode(readme.content.replace('\n', ""))?;
@@ -353,193 +325,69 @@ async fn release_files(
     repo:   &str,
     exts:   &[&str],
 ) -> Result<Vec<FileSource>> {
-    let url      = format!("https://api.github.com/repos/{owner}/{repo}/releases");
-    let releases: Vec<Release> = client
-        .get(&url)
-        .send().await?
-        .error_for_status()?
-        .json().await?;
+    // The API returns 30 releases per page by default; page through at the
+    // 100 maximum (capped at 1,000 releases) so older assets aren't missed.
+    const PER_PAGE: usize = 100;
+    let mut files = Vec::new();
+    for page in 1..=10 {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/releases?per_page={PER_PAGE}&page={page}"
+        );
+        let releases: Vec<Release> = client
+            .get(&url)
+            .send().await?
+            .error_for_status().map_err(github_error)?
+            .json().await?;
+        let last_page = releases.len() < PER_PAGE;
 
-    let files = releases
-        .into_iter()
-        .flat_map(|r| r.assets)
-        .filter(|a| matches_ext(&a.name, exts))
-        .map(|a| FileSource { name: a.name, url: a.browser_download_url })
-        .collect();
+        files.extend(
+            releases
+                .into_iter()
+                .flat_map(|r| r.assets)
+                .filter(|a| matches_ext(&a.name, exts))
+                .map(|a| FileSource { name: a.name, url: a.browser_download_url }),
+        );
+        if last_page { break; }
+    }
 
     Ok(files)
 }
 
+static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s\)\]"'<>]+"#).unwrap());
+
 pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
-    let ext_alt = exts.join("|");
-    let pattern = format!(r#"https?://[^\s\)\]"'>]+\.(?i:{ext_alt})(?:[^\s\)\]"'>]*)"#);
-    let re      = Regex::new(&pattern).unwrap();
+    // Grab every URL, then keep those whose *path* ends in a wanted extension.
+    // Matching the extension inside the regex also hit `.md` in
+    // `https://x.mdn.org/…` or `.doc` in `https://a.docs.rs/…`.
     let mut seen = HashSet::new();
 
-    re.find_iter(text)
+    URL_RE.find_iter(text)
         .filter_map(|m| {
-            let url = m.as_str().to_owned();
+            // Drop sentence punctuation that trails a bare URL in prose.
+            let raw    = m.as_str().trim_end_matches(['.', ',', ';', ':', '!']);
+            let parsed = Url::parse(raw).ok()?;
+            if !matches_ext(parsed.path(), exts) { return None; }
+
+            let url = github_raw_url(&parsed).unwrap_or_else(|| raw.to_owned());
             if !seen.insert(url.clone()) { return None; }
-            let name = url.split('/')
-                .last()
-                .and_then(|s| s.split('?').next())
-                .unwrap_or("unknown")
-                .to_owned();
+            let name = filename_from_url(&url).unwrap_or_else(|| "unknown".to_owned());
             Some(FileSource { name, url })
         })
         .collect()
 }
 
-// =============================================================================
-// Downloader  (resume + retry + exponential backoff + delay)
-// =============================================================================
-
-async fn download_file(
-    client: &Client,
-    url:    &str,
-    dest:   &PathBuf,
-) -> Result<()> {
-    let resp  = client.get(url).send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(dest, &bytes).await?;
-    Ok(())
-}
-
-async fn download_file_full(
-    client:   &Client,
-    src:      &FileSource,
-    dir:      &Path,
-    pb:       &ProgressBar,
-    resume:   bool,
-    delay_ms: Option<u64>,
-    retries:  u32,
-    quiet:    bool,
-    log:      &Arc<Mutex<Vec<LogEntry>>>,
-) -> Result<()> {
-    let dest = dir.join(&src.name);
-
-    // resume=true  → send Range header to continue a partial file
-    // resume=false → always re-download from scratch (overwrite)
-    let existing_size: u64 = if dest.exists() && resume {
-        tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0)
-    } else {
-        0
-    };
-
-    if let Some(ms) = delay_ms {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-
-    if !quiet {
-        pb.set_message(format!("{} {}", "↓".cyan(), src.name));
-    }
-
-    let mut last_err: Option<Box<dyn std::error::Error>> = None;
-
-    for attempt in 0..=retries {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt - 1))).await;
-        }
-
-        let mut req = client.get(&src.url);
-        if existing_size > 0 {
-            req = req.header("Range", format!("bytes={existing_size}-"));
-        }
-
-        let resp = match req.send().await {
-            Ok(r)  => r,
-            Err(e) => { last_err = Some(e.into()); continue; }
-        };
-
-        if resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            if !quiet {
-                pb.set_message(format!("{} {}", "complete".dimmed(), src.name.dimmed()));
-            }
-            pb.inc(1);
-            log.lock().unwrap().push(LogEntry {
-                timestamp: utc_now(),
-                filename:  src.name.clone(),
-                url:       src.url.clone(),
-                status:    "ok (already complete)".into(),
-            });
-            return Ok(());
-        }
-
-        let is_partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-
-        let resp = match resp.error_for_status() {
-            Ok(r)  => r,
-            Err(e) => {
-                if e.status().map(|s| s.is_client_error()).unwrap_or(false) {
-                    let msg = format!("{e}");
-                    log.lock().unwrap().push(LogEntry {
-                        timestamp: utc_now(),
-                        filename:  src.name.clone(),
-                        url:       src.url.clone(),
-                        status:    format!("error: {msg}"),
-                    });
-                    return Err(e.into());
-                }
-                last_err = Some(e.into());
-                continue;
-            }
-        };
-
-        let bytes = match resp.bytes().await {
-            Ok(b)  => b,
-            Err(e) => { last_err = Some(e.into()); continue; }
-        };
-
-        if is_partial && existing_size > 0 {
-            use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::OpenOptions::new().append(true).open(&dest).await?;
-            file.write_all(&bytes).await?;
-        } else {
-            tokio::fs::write(&dest, &bytes).await?;
-        }
-
-        pb.inc(1);
-        log.lock().unwrap().push(LogEntry {
-            timestamp: utc_now(),
-            filename:  src.name.clone(),
-            url:       src.url.clone(),
-            status:    "ok".into(),
-        });
-        return Ok(());
-    }
-
-    let err_msg = last_err
-        .as_ref()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "download failed after all retries".into());
-
-    log.lock().unwrap().push(LogEntry {
-        timestamp: utc_now(),
-        filename:  src.name.clone(),
-        url:       src.url.clone(),
-        status:    format!("error: {err_msg}"),
-    });
-
-    Err(last_err.unwrap_or_else(|| "download failed after all retries".into()))
-}
-
-/// Flush all log entries to `<out>/marcopolo.log`, appending to any existing file.
-async fn write_log(out: &Path, entries: &[LogEntry]) -> Result<()> {
-    if entries.is_empty() { return Ok(()); }
-    let path = out.join("marcopolo.log");
-    let mut content = String::new();
-    for e in entries {
-        let _ = FmtWrite::write_str(&mut content, &e.format());
-    }
-    // Append so multiple runs accumulate history
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await?;
-    file.write_all(content.as_bytes()).await?;
-    Ok(())
+/// README links usually point at GitHub's HTML file viewer
+/// (`github.com/o/r/blob/<ref>/<path>`); rewrite them to the raw file so we
+/// download the PDF itself rather than the web page around it.
+fn github_raw_url(url: &Url) -> Option<String> {
+    if !matches!(url.host_str()?, "github.com" | "www.github.com") { return None; }
+    let segs: Vec<&str> = url.path_segments()?.collect();
+    if segs.len() < 5 || !matches!(segs[2], "blob" | "raw") { return None; }
+    Some(format!(
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        segs[0], segs[1], segs[3..].join("/"),
+    ))
 }
 
 // =============================================================================
@@ -604,28 +452,58 @@ async fn run() -> Result<()> {
     }
     let cli = Cli::parse_from(args);
 
-    let build_client = |token: Option<&str>| -> Result<Client> {
-        let mut default_headers = header::HeaderMap::new();
-        default_headers.insert(
+    // GitHub token comes from the environment only — CLI args are visible to
+    // every user via `ps aux`.
+    let token = std::env::var("MARCOPOLO_GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+
+    // Connect/read timeouts instead of a total timeout: a total timeout aborts
+    // any download that legitimately takes longer than 30 s.
+    let base_client = || {
+        Client::builder()
+            .user_agent(concat!("marcopolo/", env!("CARGO_PKG_VERSION"), " (multi-type file downloader + book finder)"))
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(30))
+            // Never follow an HTTPS → HTTP redirect: on a plain-HTTP hop any
+            // middlebox (ISP captive portal, hostile Wi-Fi) can swap the
+            // file. The downloader re-requests such targets over HTTPS.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let downgrade = attempt.url().scheme() == "http"
+                    && attempt.previous().last().is_some_and(|u| u.scheme() == "https");
+                if downgrade {
+                    attempt.stop()
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("too many redirects")
+                } else {
+                    attempt.follow()
+                }
+            }))
+    };
+
+    // `client` talks to arbitrary hosts; `gh_client` carries the GitHub Accept
+    // header and token and is used only for GitHub hosts, so the token is
+    // never sent to third-party websites or search engines.
+    let client = base_client().build()?;
+    let gh_client = {
+        let mut gh_headers = header::HeaderMap::new();
+        gh_headers.insert(
             header::ACCEPT,
             header::HeaderValue::from_static("application/vnd.github+json"),
         );
-        if let Some(t) = token {
-            if let Ok(val) = header::HeaderValue::from_str(&format!("Bearer {t}")) {
-                default_headers.insert(header::AUTHORIZATION, val);
+        if let Some(t) = &token {
+            if let Ok(mut val) = header::HeaderValue::from_str(&format!("Bearer {t}")) {
+                val.set_sensitive(true);
+                gh_headers.insert(header::AUTHORIZATION, val);
             }
         }
-        Ok(Client::builder()
-            .user_agent("marcopolo/0.4 (multi-type file downloader + book finder)")
-            .default_headers(default_headers)
-            .timeout(Duration::from_secs(30))
-            .build()?)
+        base_client().default_headers(gh_headers).build()?
     };
 
     match cli.command {
         // ── scrape subcommand ──────────────────────────────────────────────────
-        Command::Scrape { url, kinds, out, depth, delay, resume, retries, list, filter, token, quiet } => {
-            let client = build_client(token.as_deref())?;
+        Command::Scrape { url, kinds, out, depth, delay, resume, retries, jobs, list, filter, quiet } => {
             let exts   = all_extensions(&kinds);
 
             if !quiet {
@@ -641,7 +519,7 @@ async fn run() -> Result<()> {
                 );
             }
 
-            let mut all: Vec<FileSource> = if url.contains("github.com") {
+            let mut all: Vec<FileSource> = if is_github_url(&url) {
                 let (owner, repo, subpath, branch_from_url) = parse_github_url(&url)?;
 
                 if !quiet {
@@ -653,24 +531,29 @@ async fn run() -> Result<()> {
 
                 let branch = match branch_from_url {
                     Some(b) => b,
-                    None    => default_branch(&client, &owner, &repo).await?,
+                    None    => default_branch(&gh_client, &owner, &repo).await?,
                 };
                 let sp = subpath.as_deref();
 
                 let (tree_r, readme_r, releases_r) = tokio::join!(
-                    repo_files(&client, &owner, &repo, &branch, &exts, sp),
-                    readme_files(&client, &owner, &repo, &exts, sp),
-                    release_files(&client, &owner, &repo, &exts),
+                    repo_files(&gh_client, &owner, &repo, &branch, &exts, sp),
+                    readme_files(&gh_client, &owner, &repo, &exts, sp),
+                    release_files(&gh_client, &owner, &repo, &exts),
                 );
 
                 let mut seen:  HashSet<String> = HashSet::new();
                 let mut files: Vec<FileSource> = Vec::new();
-                for f in tree_r.unwrap_or_default()
-                    .into_iter()
-                    .chain(readme_r.unwrap_or_default())
-                    .chain(releases_r.unwrap_or_default())
-                {
-                    if seen.insert(f.url.clone()) { files.push(f); }
+                for (label, result) in [("repo tree", tree_r), ("README", readme_r), ("releases", releases_r)] {
+                    match result {
+                        Ok(found) => {
+                            for f in found {
+                                if seen.insert(f.url.clone()) { files.push(f); }
+                            }
+                        }
+                        // Surface failures (e.g. 403 rate limit) instead of
+                        // silently reporting "No files found."
+                        Err(e) => eprintln!("{} {label} scan failed: {e}", "warning:".yellow()),
+                    }
                 }
                 files
             } else {
@@ -700,6 +583,14 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
+            // Names come from remote URLs/assets: confine them to `out` and
+            // keep same-named files from different folders from overwriting
+            // each other.
+            let mut used = HashSet::new();
+            for f in &mut all {
+                f.name = unique_filename(&safe_filename(&f.name), &mut used);
+            }
+
             if !quiet {
                 println!(
                     "{} {} file(s) discovered",
@@ -721,80 +612,32 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            tokio::fs::create_dir_all(&out).await?;
-
-            // ── Progress bar: bytes/sec + ETA + file count ────────────────────
-            // indicatif tokens used:
-            //   {bytes_per_sec} — rolling download throughput
-            //   {eta}           — estimated time to completion
-            //   {pos}/{len}     — files done / total
-            //   {msg}           — current filename
-            let pb = if quiet {
-                ProgressBar::hidden()
-            } else {
-                let b = ProgressBar::new(all.len() as u64);
-                b.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {bytes_per_sec}  ETA {eta}  {msg}",
-                    )
-                    .unwrap()
-                    .progress_chars("█▓░"),
-                );
-                b
-            };
-
-            let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-
-            stream::iter(all.iter())
-                .map(|src| download_file_full(
-                    &client, src, &out, &pb, resume, delay, retries, quiet, &log,
-                ))
-                .buffer_unordered(4)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .for_each(|r| {
-                    if let Err(e) = r { eprintln!("{} {e}", "download error:".red()); }
-                });
-
-            if !quiet { pb.finish_with_message("done ✓"); }
-
-            // ── Write download log ────────────────────────────────────────────
-            let entries = log.lock().unwrap();
-            if let Err(e) = write_log(&out, &entries).await {
-                eprintln!("{} could not write log: {e}", "warning:".yellow());
-            } else if !quiet && !entries.is_empty() {
-                println!(
-                    "{} log written → {}",
-                    "✓".green(),
-                    out.join("marcopolo.log").display().to_string().cyan(),
-                );
-            }
-            drop(entries);
-
-            if !quiet {
-                println!(
-                    "{} all files saved to {}",
-                    "✓".green().bold(),
-                    out.display().to_string().cyan().bold(),
-                );
+            let opts = DownloadOpts { jobs: jobs.into(), resume, delay_ms: delay, retries, quiet };
+            let summary = download_all(&client, &gh_client, &all, &out, &opts).await?;
+            if summary.failed > 0 {
+                // Non-zero exit so scripts notice partial failures.
+                return Err(format!("{} download(s) failed", summary.failed).into());
             }
         }
 
         // ── find subcommand ────────────────────────────────────────────────────
-        Command::Find { query, list, get, source, out, token, quiet } => {
-            let client = build_client(token.as_deref())?;
-
+        Command::Find { query, list, get, source, format, out, jobs, quiet } => {
             if !utils::validation::is_valid_query(&query) {
                 eprintln!("{} query must not be empty.", "error:".red().bold());
                 std::process::exit(1);
             }
 
             if !quiet {
-                let sources_label = if let Some(s) = &source {
-                    format!("[{}]", s)
-                } else {
-                    "[archive.org · openlibrary · gutenberg · anna's archive · github · googlescholar · duckduckgo]".to_string()
+                let sources_label = match &source {
+                    Some(s) => format!("[{s}]"),
+                    None    => format!(
+                        "[{}]",
+                        utils::validation::Source::ALL
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
                 };
                 println!(
                     "{} \"{}\"  {}",
@@ -818,8 +661,13 @@ async fn run() -> Result<()> {
                 b
             };
 
-            let results = find::search_all(&client, &query, source).await;
+            let mut results = find::search_all(&client, &gh_client, &query, source).await;
             pb_spin.finish_and_clear();
+
+            if let Some(fmt) = format {
+                let fmt = fmt.to_string();
+                results.retain(|r| r.format.as_deref() == Some(fmt.as_str()));
+            }
 
             if results.is_empty() {
                 if !quiet { println!("{} No results found for \"{}\".", "✗".red(), query); }
@@ -853,7 +701,11 @@ async fn run() -> Result<()> {
             if list { return Ok(()); }
 
             let chosen: Vec<usize> = if get {
-                (0..results.len()).collect()
+                // Top result from each source, as documented for --get.
+                let mut seen_sources = HashSet::new();
+                (0..results.len())
+                    .filter(|&i| seen_sources.insert(results[i].source))
+                    .collect()
             } else if quiet {
                 // In quiet mode without --get there is nothing to select interactively;
                 // just download everything.
@@ -879,8 +731,7 @@ async fn run() -> Result<()> {
                     "──────────────────────────────────────────────".dimmed(),
                 );
 
-                let mut selection = Vec::new();
-                let mut attempts  = 0usize;
+                let mut attempts = 0usize;
                 loop {
                     print!("{} ", "→".cyan().bold());
                     io::stdout().flush().ok();
@@ -890,8 +741,8 @@ async fn run() -> Result<()> {
                         println!("{} nothing downloaded.", "✗".dimmed());
                         return Ok(());
                     }
-                    selection = parse_selection(&trimmed, results.len());
-                    if !selection.is_empty() { break; }
+                    let selection = parse_selection(&trimmed, results.len());
+                    if !selection.is_empty() { break selection; }
                     attempts += 1;
                     if attempts >= 3 {
                         println!("{} no valid selection — aborting.", "✗".red());
@@ -902,108 +753,41 @@ async fn run() -> Result<()> {
                         "!".yellow().bold(), "1".cyan(), "a".green(),
                     );
                 }
-                selection
             };
 
             if chosen.is_empty() { return Ok(()); }
 
-            tokio::fs::create_dir_all(&out).await?;
+            // Archive.org / Open Library hits only carry an item id; look up
+            // the item's real public PDF (concurrently) before downloading.
+            let urls = futures::future::join_all(
+                chosen.iter().map(|&i| find::archive::resolve_download_url(&client, &results[i].url, &query)),
+            ).await;
+
+            // Many results share a title (e.g. several "Clean Code" scans), so
+            // give each download its own filename instead of overwriting.
+            let mut used = HashSet::new();
+            let files: Vec<FileSource> = chosen
+                .iter()
+                .zip(urls)
+                .map(|(&i, url)| FileSource {
+                    name: unique_filename(&safe_filename(&results[i].filename), &mut used),
+                    url,
+                })
+                .collect();
 
             if !quiet {
                 println!(
                     "\n{} downloading {} file(s) → {}",
                     "↓".cyan().bold(),
-                    chosen.len(),
+                    files.len(),
                     out.display().to_string().cyan(),
                 );
             }
 
-            // ── Progress bar with throughput + ETA ────────────────────────────
-            let pb_dl = if quiet {
-                ProgressBar::hidden()
-            } else {
-                let b = ProgressBar::new(chosen.len() as u64);
-                b.set_style(
-                    ProgressStyle::with_template(
-                        "  {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len}  {bytes_per_sec}  ETA {eta}  {msg}"
-                    )
-                    .unwrap()
-                    .progress_chars("█▓░"),
-                );
-                b
-            };
-
-            let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-            let mut errors: Vec<String> = Vec::new();
-
-            for idx in &chosen {
-                let r    = &results[*idx];
-                let dest = out.join(&r.filename);
-                if !quiet { pb_dl.set_message(format!("{}", r.filename.dimmed())); }
-
-                match download_file(&client, &r.url, &dest).await {
-                    Ok(()) => {
-                        if !quiet {
-                            pb_dl.println(format!(
-                                "  {} ({})  {}",
-                                "✓".green().bold(), r.source.yellow(), r.filename,
-                            ));
-                        }
-                        log.lock().unwrap().push(LogEntry {
-                            timestamp: utc_now(),
-                            filename:  r.filename.clone(),
-                            url:       r.url.clone(),
-                            status:    "ok".into(),
-                        });
-                    }
-                    Err(e) => {
-                        let msg = format!("  {} ({})  {}:  {e}",
-                            "✗".red().bold(), r.source.yellow(), r.filename);
-                        if !quiet { pb_dl.println(msg.clone()); }
-                        log.lock().unwrap().push(LogEntry {
-                            timestamp: utc_now(),
-                            filename:  r.filename.clone(),
-                            url:       r.url.clone(),
-                            status:    format!("error: {e}"),
-                        });
-                        errors.push(msg);
-                    }
-                }
-                pb_dl.inc(1);
-            }
-
-            pb_dl.finish_and_clear();
-
-            // ── Write log ─────────────────────────────────────────────────────
-            let entries = log.lock().unwrap();
-            if let Err(e) = write_log(&out, &entries).await {
-                eprintln!("{} could not write log: {e}", "warning:".yellow());
-            } else if !quiet && !entries.is_empty() {
-                println!(
-                    "{} log written → {}",
-                    "✓".green(),
-                    out.join("marcopolo.log").display().to_string().cyan(),
-                );
-            }
-            drop(entries);
-
-            let ok_count = chosen.len() - errors.len();
-            if !quiet {
-                if ok_count > 0 {
-                    println!(
-                        "\n{} {} file(s) saved to {}",
-                        "✓".green().bold(),
-                        ok_count.to_string().green().bold(),
-                        out.display().to_string().cyan().bold(),
-                    );
-                }
-                if !errors.is_empty() {
-                    println!(
-                        "{} {} download(s) failed.",
-                        "✗".red().bold(),
-                        errors.len().to_string().red(),
-                    );
-                }
+            let opts = DownloadOpts { jobs: jobs.into(), resume: false, delay_ms: None, retries: 3, quiet };
+            let summary = download_all(&client, &gh_client, &files, &out, &opts).await?;
+            if summary.failed > 0 {
+                return Err(format!("{} download(s) failed", summary.failed).into());
             }
         }
     }
@@ -1017,7 +801,7 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_selection;
+    use super::{extract_file_links, is_github_url, matches_ext, parse_github_url, parse_selection};
 
     #[test]
     fn select_single() { assert_eq!(parse_selection("1", 5), vec![0]); }
@@ -1051,4 +835,31 @@ mod tests {
 
     #[test]
     fn select_q_returns_empty() { assert!(parse_selection("q", 5).is_empty()); }
+
+    #[test]
+    fn github_host_detection() {
+        assert!(is_github_url("https://github.com/owner/repo"));
+        assert!(!is_github_url("https://example.com/?ref=github.com"));
+    }
+
+    #[test]
+    fn github_url_strips_dot_git() {
+        let (_, repo, _, _) = parse_github_url("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn matches_ext_ignores_fragment() {
+        assert!(matches_ext("https://x.org/a.pdf#page=2", &["pdf"]));
+    }
+
+    #[test]
+    fn readme_links_match_path_extension_only() {
+        let text = "see https://developer.mdn.org/guide and \
+                    [book](https://x.org/files/book.md). Also https://x.org/a.pdf, done";
+        let found = extract_file_links(text, &["md", "pdf"]);
+        let urls: Vec<_> = found.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(urls, ["https://x.org/files/book.md", "https://x.org/a.pdf"]);
+        assert_eq!(found[0].name, "book.md");
+    }
 }

@@ -12,7 +12,8 @@ use url::Url;
 use crate::utils::slug::slug;
 use super::types::FindResult;
 
-const RESULTS_FIELD: &str = "results";
+/// Gutendex returns up to 32 books per page; keep the list readable.
+const MAX_RESULTS: usize = 5;
 
 #[derive(Deserialize)]
 struct Resp { results: Vec<Book> }
@@ -38,7 +39,6 @@ const FORMAT_PRIORITY: &[(&str, &str)] = &[
 
 /// Search Gutendex for `query` and return the best-format download link.
 pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
-    let _ = RESULTS_FIELD; // suppress unused-constant lint
     let mut url = match Url::parse("https://gutendex.com/books") {
         Ok(u)  => u,
         Err(_) => return vec![],
@@ -54,7 +54,7 @@ pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
         Err(_) => return vec![],
     };
 
-    data.results.into_iter().filter_map(|book| {
+    data.results.into_iter().take(MAX_RESULTS).filter_map(|book| {
         let (dl_url, fmt) = FORMAT_PRIORITY
             .iter()
             .find_map(|(mime, ext)| {

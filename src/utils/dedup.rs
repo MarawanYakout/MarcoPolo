@@ -3,26 +3,6 @@
 use rustc_hash::FxHashSet;
 use std::hash::Hash;
 
-/// Remove duplicate strings while preserving insertion order.
-///
-/// # Examples
-/// ```
-/// let v = dedup_strings(vec!["a".into(), "b".into(), "a".into()]);
-/// assert_eq!(v, ["a", "b"]);
-/// ```
-pub fn dedup_strings(mut items: Vec<String>) -> Vec<String> {
-    let mut seen: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(items.len(), Default::default());
-    items.retain(|item| {
-        if seen.contains(item) {
-            false
-        } else {
-            seen.insert(item.clone());
-            true
-        }
-    });
-    items
-}
-
 /// Remove duplicate items by a key function, preserving insertion order.
 ///
 /// # Examples
@@ -43,35 +23,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dedup_removes_duplicates() {
-        let input = vec!["a".into(), "b".into(), "a".into(), "c".into()];
-        assert_eq!(
-            dedup_strings(input),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-    }
-
-    #[test]
-    fn dedup_preserves_order() {
-        let input = vec!["z".into(), "a".into(), "m".into(), "a".into()];
-        assert_eq!(
-            dedup_strings(input),
-            vec!["z".to_string(), "a".to_string(), "m".to_string()]
-        );
-    }
-
-    #[test]
-    fn dedup_empty_vec() {
-        assert!(dedup_strings(vec![]).is_empty());
-    }
-
-    #[test]
-    fn dedup_all_duplicates() {
-        let input = vec!["x".into(), "x".into(), "x".into()];
-        assert_eq!(dedup_strings(input), vec!["x".to_string()]);
-    }
 
     #[test]
     fn dedup_by_key_basic() {

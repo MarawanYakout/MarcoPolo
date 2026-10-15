@@ -80,9 +80,10 @@ Want to target specific file types? Use `--type`:
 
 Marcopolo operates in two modes depending on the URL you give it:
 
-**GitHub mode** — when the URL contains `github.com`:
+**GitHub mode** — when the URL is on `github.com`:
 1. Scans the full repository tree for committed files
-2. Decodes the README and extracts all hyperlinks
+2. Decodes the README and extracts all hyperlinks (`/blob/` links are
+   rewritten to the raw file)
 3. Scans all GitHub Release assets
 4. All three run in parallel
 
@@ -92,7 +93,11 @@ Marcopolo operates in two modes depending on the URL you give it:
 3. Only follows same-origin links — never crawls external sites
 
 All discovered files are deduplicated by URL, then downloaded concurrently
-(4 at a time by default) into `./downloads/`.
+(4 at a time by default, see `--jobs`) into `./downloads/`. Files with the same
+name get `_1`, `_2`, … suffixes instead of overwriting each other.
+
+Each file streams to `<name>.part` and is renamed only when complete, so an
+interrupted run never leaves a truncated file behind under the real name.
 
 ---
 
@@ -104,12 +109,16 @@ All discovered files are deduplicated by URL, then downloaded concurrently
 | `--type`, `-t` | `pdf` | File type(s) to hunt. Repeatable. |
 | `--out`, `-o` | `downloads` | Output directory |
 | `--depth` | `1` | BFS crawl depth (web mode only) |
-| `--delay` | none | Milliseconds between downloads |
-| `--continue` | off | Resume partially downloaded files |
+| `--delay` | none | Minimum milliseconds between requests (across all jobs) |
+| `--continue` | off | Resume `.part` files, skip files already downloaded |
 | `--retries` | `3` | Retry attempts on failure |
+| `--jobs`, `-j` | `4` | Files downloaded in parallel (1–64) |
 | `--list` | off | Dry run — list files without downloading |
 | `--filter` | none | Only download files matching this keyword |
-| `--token` | none | GitHub personal access token |
+| `--quiet` | off | Suppress all output except errors |
+
+A GitHub token is read from the `GITHUB_TOKEN` (or `MARCOPOLO_GITHUB_TOKEN`)
+environment variable — see [Use a GitHub token](#use-a-github-token-recommended).
 
 ### Supported file types
 
@@ -228,8 +237,12 @@ Generate one at: [github.com/settings/tokens](https://github.com/settings/tokens
 No scopes needed for public repos. Add `repo` scope for private repos.
 
 ```bash
-marcopolo https://github.com/owner/repo --token ghp_xxxxxxxxxxxxxxxxxxxx
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+marcopolo https://github.com/owner/repo
 ```
+
+The token is read from the environment (never a CLI flag, which would be
+visible to other users via `ps`) and is only sent to GitHub hosts.
 
 ---
 
@@ -239,8 +252,9 @@ marcopolo https://github.com/owner/repo --token ghp_xxxxxxxxxxxxxxxxxxxx
 marcopolo https://github.com/owner/repo --continue
 ```
 
-Sends a `Range` header and appends bytes to partially downloaded files
-instead of restarting from zero.
+Files that are already fully downloaded are skipped without a request, and
+`.part` files are continued with a `Range` request instead of restarting
+from zero. Retries within a run always resume from the bytes already received.
 
 ---
 
@@ -250,7 +264,19 @@ instead of restarting from zero.
 marcopolo https://somesite.com --delay 500
 ```
 
-Waits 500ms before each download. Useful for sites that rate-limit scrapers.
+Spaces request starts at least 500ms apart, even with several parallel
+jobs. Useful for sites that rate-limit scrapers.
+
+---
+
+### Download faster
+
+```bash
+marcopolo https://github.com/owner/repo --jobs 16
+```
+
+Raises parallel downloads from 4 to 16 (max 64). Each active download shows
+its own progress bar with real bytes and speed.
 
 ---
 
@@ -270,8 +296,8 @@ Retries failed downloads up to 5 times with exponential back-off (500ms, 1s, 2s�
 ### Grab every ML paper PDF from a curated list
 
 ```bash
+export GITHUB_TOKEN=ghp_xxx
 marcopolo "https://github.com/Carl-McBride-Ellis/Compendium-of-free-ML-reading-resources" \
-  --token ghp_xxx \
   --out ~/ml-papers \
   --retries 5 \
   --delay 200
@@ -334,10 +360,16 @@ When you use `find`, Marcopolo queries these sources in parallel:
 *   **Internet Archive** (archive.org) — Reliable JSON API
 *   **Open Library** (openlibrary.org) — Curated metadata
 *   **Project Gutenberg** (gutenberg.org) — Via Gutendex API
-*   **Anna's Archive** (annas-archive.org) — Real-time HTML scraping of the largest catalog
+*   **Anna's Archive** (annas-archive.org) — HTML scraping; often blocked by a bot check, in which case it simply returns no results
 *   **Github** (Github.com) — Searches PDFs with similar names on github
 *   **Googlescholar** (Googlescholar.com) — Searches PDFs / Books / Articles with similar names on Googlescholar
 *   **Duckduckgo** (Duckduckgo.com) — Searches PDFs with similar names using Duckduckgo 0% data collection
+
+Results from all sources are ranked by how well their title matches your
+query; results sharing no word with it are dropped. A source that hasn't
+answered within 12 seconds is skipped, so one slow site can't stall the search.
+Archive.org results only include publicly downloadable items (lend-only books
+are excluded), and the real PDF inside each item is looked up before download.
 
 
 
@@ -363,6 +395,11 @@ marcopolo find "Computer Systems" --source archive
 **List results for a specific query without downloading:**
 ```bash
 marcopolo find "Rust Programming" --list
+```
+
+**Only show one format (`pdf`, `epub`, `txt`, `mobi`, `djvu`):**
+```bash
+marcopolo find "Pride and Prejudice" --format txt --get
 ```
 
 ### Advanced PDF Finding
@@ -395,8 +432,11 @@ These are printed during a run and are **normal**. They do not crash marcopolo.
 | `403 Forbidden` | The server blocks direct downloads |
 | `500 Domain Not Found` | The website no longer exists |
 | `error sending request` | The server is unreachable or timed out |
+| `server returned an HTML page, not the file` | The link leads to a web page (login wall, landing page, soft 404) rather than the file |
 
-Every file that *can* be downloaded will be. Dead links are skipped and reported.
+Every file that *can* be downloaded will be. Dead links are skipped and reported,
+every outcome is appended to `<out>/marcopolo.log`, and marcopolo exits with
+status `1` if any download failed, so scripts can detect partial failures.
 
 Check what was successfully saved:
 
