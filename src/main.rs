@@ -180,7 +180,7 @@ fn utc_now() -> String {
         y   += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let days_in = [31u32,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];
+    let days_in = [31u64,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];
     let (mut mo, mut d) = (1u32, rem + 1);
     for dim in &days_in {
         if d <= *dim { break; }
