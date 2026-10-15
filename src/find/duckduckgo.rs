@@ -1,6 +1,7 @@
 use reqwest::Client;
 use scraper::{Html, Selector};
 use percent_encoding::{utf8_percent_encode, percent_decode_str, NON_ALPHANUMERIC};
+use crate::utils::slug::slug;
 use super::types::FindResult;
 
 pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
@@ -48,8 +49,7 @@ pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
                         "DuckDuckGo PDF".to_string()
                     };
 
-                    let clean_title = title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "_");
-                    let filename = format!("{}.pdf", clean_title);
+                    let filename = format!("{}.pdf", slug(&title));
 
                     results.push(FindResult {
                         source: "duckduckgo.com",

@@ -11,7 +11,7 @@ pub struct FindResult {
     pub url:    String,
     /// File format hint if known (e.g. `Some("pdf")`).
     pub format: Option<String>,
-    /// Relevance score when available (higher = better match).
+    /// Relevance to the query, filled in by `search_all` (higher = better).
     pub score:  Option<f32>,
     /// Suggested local filename derived from the title and format.
     pub filename: String,

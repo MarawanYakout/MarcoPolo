@@ -1,4 +1,4 @@
-//! Generic web scraper for marcopolo v0.3
+//! Generic web scraper for marcopolo
 //!
 //! Strategy:
 //!   1. Check `/sitemap.xml` at the root domain — fast discovery path.
@@ -14,19 +14,25 @@
 
 use std::{
     collections::HashSet,
+    sync::LazyLock,
     time::Duration,
 };
 
-use percent_encoding::percent_decode_str;
+use futures::stream::{self, StreamExt};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use url::Url;
 
+use crate::utils::parsing::filename_from_url;
 use crate::{matches_ext, FileSource, Result};
 
-// ── Compile selectors once at startup so they are not rebuilt per page ────────
-fn link_sel()   -> Selector { Selector::parse("a[href]").unwrap() }
-fn src_sel()    -> Selector { Selector::parse("source[src], img[src], video[src]").unwrap() }
+// ── Compiled once, not rebuilt for every page ─────────────────────────────────
+static LINK_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href]").unwrap());
+static SRC_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("source[src], img[src], video[src]").unwrap());
+static LOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<loc>\s*(https?://[^\s<]+)\s*</loc>").unwrap());
 
 // =============================================================================
 // Public entry point
@@ -68,31 +74,34 @@ pub async fn scrape_files(
 
         if to_fetch.is_empty() { continue; }
 
-        // Fetch all pages at this depth level concurrently
-        let fetched = futures::future::join_all(
-            to_fetch.into_iter().map(|url| {
-                let client = client.clone();
-                async move {
-                    let html = fetch_html_timeout(&client, &url)
-                        .await
-                        .unwrap_or_default();
-                    (url, html)
-                }
+        // Fetch pages at this depth level concurrently, at most 8 in flight
+        // so a link-heavy page doesn't fire hundreds of requests at once.
+        // `buffered` keeps discovery order stable between runs.
+        let fetched: Vec<(String, String)> = stream::iter(to_fetch)
+            .map(|url| async move {
+                let html = fetch_html_timeout(client, &url)
+                    .await
+                    .unwrap_or_default();
+                (url, html)
             })
-        ).await;
+            .buffered(8)
+            .collect()
+            .await;
 
         for (url, html) in &fetched {
             if html.is_empty() { continue; }
             let Ok(base) = Url::parse(url) else { continue };
+            // Parse once and reuse the DOM for both passes below.
+            let doc = Html::parse_document(html);
 
             // Collect matching files on this page (hrefs + src attributes)
-            for f in extract_file_links(html, &base, exts) {
+            for f in extract_file_links(&doc, &base, exts) {
                 if seen_f.insert(f.url.clone()) { files.push(f); }
             }
 
             // Enqueue same-origin non-file links for the next level
             if depth < max_depth {
-                for link in extract_internal_links(html, &base, exts) {
+                for link in extract_internal_links(&doc, &base, exts) {
                     let clean = strip_fragment(&link);
                     if !seen_pg.contains(&clean) {
                         frontier.push(clean);
@@ -116,12 +125,12 @@ async fn scrape_all_sitemaps(
     base:   &Url,
     exts:   &[&str],
 ) -> Vec<FileSource> {
-    let root = format!("{}://{}", base.scheme(), base.host_str().unwrap_or(""));
-
-    let candidates = [
-        format!("{root}/sitemap.xml"),
-        format!("{root}/sitemap_index.xml"),
-    ];
+    // `join` keeps scheme, host *and* port (e.g. http://localhost:8080).
+    let candidates: Vec<String> = ["/sitemap.xml", "/sitemap_index.xml"]
+        .iter()
+        .filter_map(|p| base.join(p).ok())
+        .map(String::from)
+        .collect();
 
     let mut all: Vec<FileSource> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -178,8 +187,7 @@ async fn scrape_all_sitemaps(
 
 /// Extracts all `<loc>` text values from a sitemap XML body.
 fn parse_sitemap_locs(xml: &str) -> Vec<String> {
-    let re = Regex::new(r"<loc>\s*(https?://[^\s<]+)\s*</loc>").unwrap();
-    re.captures_iter(xml)
+    LOC_RE.captures_iter(xml)
         .filter_map(|c| c.get(1))
         .map(|m| m.as_str().trim().to_owned())
         .collect()
@@ -199,7 +207,14 @@ async fn fetch_html_timeout(client: &reqwest::Client, url: &str) -> Result<Strin
     .await
     .map_err(|_| format!("timeout fetching {url}"))??;
 
-    if !resp.status().is_success() {
+    // Skip non-HTML responses (archives, media linked from the page) instead
+    // of buffering a possibly huge binary just to find no links in it.
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|ct| ct.contains("html"));
+    if !resp.status().is_success() || !is_html {
         return Ok(String::new());
     }
 
@@ -212,22 +227,19 @@ async fn fetch_html_timeout(client: &reqwest::Client, url: &str) -> Result<Strin
 
 /// Extracts every `<a href>`, `<source src>`, `<img src>`, and `<video src>`
 /// whose resolved URL matches `exts`. URL-decodes filenames.
-fn extract_file_links(html: &str, base: &Url, exts: &[&str]) -> Vec<FileSource> {
-    let doc       = Html::parse_document(html);
+fn extract_file_links(doc: &Html, base: &Url, exts: &[&str]) -> Vec<FileSource> {
     let mut seen  = HashSet::new();
     let mut found = Vec::new();
 
     // ── <a href> ──────────────────────────────────────────────────────────────
-    let link_selector = link_sel();
-    for el in doc.select(&link_selector) {
+    for el in doc.select(&LINK_SEL) {
         if let Some(f) = resolve_attr(el, "href", base, exts, &mut seen) {
             found.push(f);
         }
     }
 
     // ── <source src>, <img src>, <video src> ──────────────────────────────────
-    let src_selector = src_sel();
-    for el in doc.select(&src_selector) {
+    for el in doc.select(&SRC_SEL) {
         if let Some(f) = resolve_attr(el, "src", base, exts, &mut seen) {
             found.push(f);
         }
@@ -247,7 +259,7 @@ fn resolve_attr(
 ) -> Option<FileSource> {
     let raw     = el.value().attr(attr)?;
     let abs     = base.join(raw).ok()?;
-    let url_str = strip_fragment(&abs.to_string());
+    let url_str = strip_fragment(abs.as_str());
 
     // Check extension against the path only (ignore query string)
     if !matches_ext(abs.path(), exts) { return None; }
@@ -259,13 +271,11 @@ fn resolve_attr(
 
 /// Returns all same-origin, non-file `<a href>` links for BFS expansion.
 /// Strips fragments and skips anchors, mailto:, javascript:, and tel: links.
-fn extract_internal_links(html: &str, base: &Url, exts: &[&str]) -> Vec<String> {
-    let doc    = Html::parse_document(html);
-    let sel    = link_sel();
-    let origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or(""));
+fn extract_internal_links(doc: &Html, base: &Url, exts: &[&str]) -> Vec<String> {
+    let origin = base.origin();
     let mut seen = HashSet::new();
 
-    doc.select(&sel)
+    doc.select(&LINK_SEL)
         .filter_map(|el: ElementRef| {
             let raw  = el.value().attr("href")?;
 
@@ -279,9 +289,11 @@ fn extract_internal_links(html: &str, base: &Url, exts: &[&str]) -> Vec<String> 
             }
 
             let abs  = base.join(raw).ok()?;
-            let url  = strip_fragment(&abs.to_string());
+            let url  = strip_fragment(abs.as_str());
 
-            if !url.starts_with(&origin)         { return None; } // external
+            // Compare real origins: a string prefix check let
+            // `https://example.com.evil.org/` through for `https://example.com`.
+            if abs.origin() != origin            { return None; } // external
             if matches_ext(abs.path(), exts)     { return None; } // it's a file, not a page
             if seen.insert(url.clone()) { Some(url) } else { None }
         })
@@ -300,17 +312,28 @@ fn strip_fragment(url: &str) -> String {
     }
 }
 
-/// Derives a clean filename from a URL:
-///   - Takes the last path segment
-///   - Strips the query string
-///   - URL-decodes percent-encoded characters (%20 → space)
-///   - Falls back to "unknown" if the segment is empty
+/// Derives a clean, URL-decoded filename from a URL (`%20` → space),
+/// falling back to "unknown".
 fn clean_filename(url: &str) -> String {
-    let path_part = url.split('?').next().unwrap_or(url);
-    let raw_name  = path_part.split('/').last().unwrap_or("unknown");
-    let decoded   = percent_decode_str(raw_name)
-        .decode_utf8()
-        .map(|s| s.into_owned())
-        .unwrap_or_else(|_| raw_name.to_owned());
-    if decoded.is_empty() { "unknown".to_owned() } else { decoded }
+    filename_from_url(url).unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_links_stay_on_same_origin() {
+        let base = Url::parse("https://example.com/docs/").unwrap();
+        let html = r#"
+            <a href="/about">same</a>
+            <a href="https://example.com.evil.org/x">lookalike</a>
+            <a href="https://example.community/y">prefix</a>
+            <a href="http://example.com/z">other scheme</a>
+        "#;
+        assert_eq!(
+            extract_internal_links(&Html::parse_document(html), &base, &["pdf"]),
+            vec!["https://example.com/about".to_owned()]
+        );
+    }
 }

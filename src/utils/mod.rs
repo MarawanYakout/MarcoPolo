@@ -5,5 +5,6 @@
 
 pub mod dedup;
 pub mod parsing;
+pub mod relevance;
 pub mod slug;
 pub mod validation;

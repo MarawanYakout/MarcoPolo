@@ -2,16 +2,22 @@
 //!
 //! Endpoint: `https://openlibrary.org/search.json`
 //!
-//! Only books that have an Internet Archive identifier (`ia` field) are
-//! returned — those are the ones with freely downloadable full-text PDFs.
+//! Only public-domain books (`ebook_access = "public"`) are returned —
+//! borrowable ones have no free download. Each book lists many Internet
+//! Archive scans, some of them lend-only, so the first few are checked
+//! until one with a public PDF is found.
 
 use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 use crate::utils::slug::slug;
+use super::archive::public_pdf_url;
 use super::types::FindResult;
 
 const LIMIT: &str = "6";
+
+/// Scans checked per book before giving up on it.
+const MAX_SCANS: usize = 3;
 
 #[derive(Deserialize)]
 struct Resp { docs: Vec<Doc> }
@@ -20,9 +26,11 @@ struct Doc {
     title: String,
     #[serde(default)]
     ia: Vec<String>,
+    #[serde(default)]
+    ebook_access: String,
 }
 
-/// Search Open Library for `query` and return books that have IA full-text.
+/// Search Open Library for `query` and return public books with a PDF scan.
 pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
     let mut url = match Url::parse("https://openlibrary.org/search.json") {
         Ok(u)  => u,
@@ -31,7 +39,8 @@ pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
     url.query_pairs_mut()
         .append_pair("title",        query)
         .append_pair("limit",        LIMIT)
-        .append_pair("has_fulltext", "true");
+        .append_pair("has_fulltext", "true")
+        .append_pair("fields",       "title,ia,ebook_access");
 
     let resp = match client.get(url).send().await {
         Ok(r)  => r,
@@ -42,17 +51,26 @@ pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
         Err(_) => return vec![],
     };
 
-    data.docs.into_iter().filter_map(|doc| {
-        let ia_id = doc.ia.into_iter().next()?;
-        let dl_url   = format!("https://archive.org/download/{ia}/{ia}.pdf", ia = ia_id);
-        let filename = format!("{}.pdf", slug(&doc.title));
-        Some(FindResult {
-            source:   "openlibrary.org",
-            title:    doc.title,
-            url:      dl_url,
-            format:   Some("pdf".to_owned()),
-            score:    None,
-            filename,
-        })
-    }).collect()
+    let found = futures::future::join_all(
+        data.docs
+            .into_iter()
+            .filter(|doc| doc.ebook_access == "public")
+            .map(|doc| async move {
+                for id in doc.ia.iter().take(MAX_SCANS) {
+                    if let Some(dl_url) = public_pdf_url(client, id, &doc.title).await {
+                        return Some(FindResult {
+                            source:   "openlibrary.org",
+                            filename: format!("{}.pdf", slug(&doc.title)),
+                            title:    doc.title,
+                            url:      dl_url,
+                            format:   Some("pdf".to_owned()),
+                            score:    None,
+                        });
+                    }
+                }
+                None
+            }),
+    ).await;
+
+    found.into_iter().flatten().collect()
 }
