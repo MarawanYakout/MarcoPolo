@@ -12,15 +12,12 @@
 use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
-use crate::utils::parsing::encode_path;
+use crate::archive_org::{download_url, fetch_meta, MetaFile, NOT_RESTRICTED};
 use crate::utils::relevance::relevance;
 use crate::utils::slug::slug;
 use super::types::FindResult;
 
 const MAX_ROWS: &str = "8";
-
-/// Lend-only collections: their PDFs are private or DRM-encrypted.
-const NOT_RESTRICTED: &str = "NOT collection:(inlibrary OR printdisabled)";
 
 #[derive(Deserialize)]
 struct Resp  { response: Inner }
@@ -80,39 +77,16 @@ pub async fn search(client: &Client, query: &str) -> Vec<FindResult> {
 
 // ── Item metadata ─────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct Meta {
-    #[serde(default)]
-    files: Vec<MetaFile>,
-}
-
-#[derive(Deserialize)]
-struct MetaFile {
-    name: String,
-    #[serde(default)]
-    format: String,
-    /// Present (as `"true"`) on lend-only files, which return 403.
-    #[serde(default)]
-    private: Option<serde_json::Value>,
-}
-
 /// Find a publicly downloadable PDF inside archive item `id`: `{id}.pdf`
 /// when present, otherwise the PDF whose name best matches `hint` (items
 /// can hold dozens of PDFs). `None` when the item has no public PDF.
 pub async fn public_pdf_url(client: &Client, id: &str, hint: &str) -> Option<String> {
-    let meta: Meta = client
-        .get(format!("https://archive.org/metadata/{id}"))
-        .send().await.ok()?
-        .json().await.ok()?;
+    let meta = fetch_meta(client, id).await.ok()?;
 
     let pdfs: Vec<&MetaFile> = meta
         .files
         .iter()
-        .filter(|f| {
-            f.name.to_lowercase().ends_with(".pdf")
-                && f.private.is_none()
-                && !f.format.contains("Encrypted")
-        })
+        .filter(|f| f.name.to_lowercase().ends_with(".pdf") && f.is_public())
         .collect();
 
     let own  = format!("{id}.pdf");
@@ -121,7 +95,7 @@ pub async fn public_pdf_url(client: &Client, id: &str, hint: &str) -> Option<Str
         pdfs.iter().rev().max_by(|a, b| relevance(hint, &a.name).total_cmp(&relevance(hint, &b.name)))
     })?;
 
-    Some(format!("https://archive.org/download/{id}/{}", encode_path(&best.name)))
+    Some(download_url(id, &best.name))
 }
 
 /// Swap a guessed `archive.org/download/{id}/{id}.pdf` URL for the item's

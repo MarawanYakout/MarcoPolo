@@ -11,6 +11,10 @@
 //!   6. Only same-origin links are followed — never crawls external sites.
 //!   7. Fragments (#section) are stripped before dedup so the same page
 //!      is not fetched twice under different fragment identifiers.
+//!   8. Links to archive.org item/search pages and Google Drive files and
+//!      folders (`<a href>`, or a Drive viewer in an `<iframe>`) are collected too,
+//!      not crawled; the caller looks up their files via
+//!      `archive_org::resolve` and `google_drive::resolve`.
 
 use std::{
     collections::HashSet,
@@ -23,14 +27,18 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use url::Url;
 
+use crate::archive_org::{self, ArchiveLink};
+use crate::google_drive::{self, DriveLink};
 use crate::utils::parsing::filename_from_url;
-use crate::{matches_ext, FileSource, Result};
+use crate::{matches_ext, Discovered, FileSource, Result};
 
 // ── Compiled once, not rebuilt for every page ─────────────────────────────────
 static LINK_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a[href]").unwrap());
 static SRC_SEL: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("source[src], img[src], video[src]").unwrap());
+static IFRAME_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("iframe[src]").unwrap());
 static LOC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<loc>\s*(https?://[^\s<]+)\s*</loc>").unwrap());
 
@@ -38,17 +46,20 @@ static LOC_RE: LazyLock<Regex> =
 // Public entry point
 // =============================================================================
 
-/// Discovers all files matching `exts` reachable from `page_url`,
-/// scanning up to `max_depth` BFS levels deep.
+/// Discovers all files matching `exts` reachable from `page_url`, scanning up
+/// to `max_depth` BFS levels deep, plus every archive.org item/search page and
+/// Google Drive file or folder linked along the way.
 pub async fn scrape_files(
     client:    &reqwest::Client,
     page_url:  &str,
     max_depth: usize,
     exts:      &[&str],
-) -> Result<Vec<FileSource>> {
+) -> Result<Discovered> {
     let base_url = Url::parse(page_url)?;
 
     let mut files:   Vec<FileSource>    = Vec::new();
+    let mut archive: Vec<ArchiveLink>   = Vec::new();
+    let mut drive:   Vec<DriveLink>     = Vec::new();
     let mut seen_f:  HashSet<String>    = HashSet::new(); // dedup by URL
     let mut seen_pg: HashSet<String>    = HashSet::new(); // dedup pages visited
 
@@ -98,6 +109,8 @@ pub async fn scrape_files(
             for f in extract_file_links(&doc, &base, exts) {
                 if seen_f.insert(f.url.clone()) { files.push(f); }
             }
+            archive.extend(extract_archive_links(&doc, &base));
+            drive.extend(extract_drive_links(&doc, &base));
 
             // Enqueue same-origin non-file links for the next level
             if depth < max_depth {
@@ -111,7 +124,7 @@ pub async fn scrape_files(
         }
     }
 
-    Ok(files)
+    Ok(Discovered { files, archive, drive })
 }
 
 // =============================================================================
@@ -259,7 +272,8 @@ fn resolve_attr(
 ) -> Option<FileSource> {
     let raw     = el.value().attr(attr)?;
     let abs     = base.join(raw).ok()?;
-    let url_str = strip_fragment(abs.as_str());
+    // An archive.org viewer link (`/details/<id>/x.pdf`) becomes the file itself.
+    let url_str = archive_org::file_url(&abs).unwrap_or_else(|| strip_fragment(abs.as_str()));
 
     // Check extension against the path only (ignore query string)
     if !matches_ext(abs.path(), exts) { return None; }
@@ -267,6 +281,28 @@ fn resolve_attr(
 
     let name = clean_filename(&url_str);
     Some(FileSource { name, url: url_str })
+}
+
+/// archive.org item and search pages linked from `<a href>`s; duplicates are
+/// dropped later, in `archive_org::resolve`.
+fn extract_archive_links(doc: &Html, base: &Url) -> Vec<ArchiveLink> {
+    doc.select(&LINK_SEL)
+        .filter_map(|el| base.join(el.value().attr("href")?).ok())
+        .filter_map(|abs| archive_org::parse_link(&abs))
+        .collect()
+}
+
+/// Google Drive files and folders linked from `<a href>`s or shown in an
+/// `<iframe>` (sites often embed a Drive PDF viewer or folder view);
+/// duplicates are dropped later, in `google_drive::resolve`.
+fn extract_drive_links(doc: &Html, base: &Url) -> Vec<DriveLink> {
+    let hrefs = doc.select(&LINK_SEL).filter_map(|el| el.value().attr("href"));
+    let frames = doc.select(&IFRAME_SEL).filter_map(|el| el.value().attr("src"));
+    hrefs
+        .chain(frames)
+        .filter_map(|raw| base.join(raw).ok())
+        .filter_map(|abs| google_drive::parse_link(&abs))
+        .collect()
 }
 
 /// Returns all same-origin, non-file `<a href>` links for BFS expansion.
@@ -335,5 +371,54 @@ mod tests {
             extract_internal_links(&Html::parse_document(html), &base, &["pdf"]),
             vec!["https://example.com/about".to_owned()]
         );
+    }
+
+    #[test]
+    fn archive_links_collected_from_anchors() {
+        let base = Url::parse("https://example.com/books/").unwrap();
+        let html = r#"
+            <a href="https://archive.org/details/foo/page/n5/mode/2up">item</a>
+            <a href="https://archive.org/search?query=calculus">search</a>
+            <a href="https://web.archive.org/web/2020/https://x.org/">wayback</a>
+            <a href="/details/not-archive">local</a>
+        "#;
+        assert_eq!(
+            extract_archive_links(&Html::parse_document(html), &base),
+            [ArchiveLink::Item("foo".into()), ArchiveLink::Search("calculus".into())],
+        );
+    }
+
+    #[test]
+    fn drive_links_from_anchors_and_iframes() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let html = r#"
+            <a href="https://drive.google.com/file/d/1Rx7MAekKZbyNVc5B2MNfR0HXXIEJCksp/view">pdf</a>
+            <iframe src="https://drive.google.com/file/d/1l_5RK28JRL19wpT22B-DY9We3TVXnnQQ/preview"></iframe>
+            <iframe src="https://drive.google.com/embeddedfolderview?id=1AbCdEfGhIjKlMnOpQrStUvWxYz#grid"></iframe>
+        "#;
+        let found: Vec<String> = extract_drive_links(&Html::parse_document(html), &base)
+            .into_iter()
+            .map(|l| match l {
+                DriveLink::File(f) => format!("file {}", f.id),
+                DriveLink::Folder(f) => format!("folder {}", f.id),
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "file 1Rx7MAekKZbyNVc5B2MNfR0HXXIEJCksp",
+                "file 1l_5RK28JRL19wpT22B-DY9We3TVXnnQQ",
+                "folder 1AbCdEfGhIjKlMnOpQrStUvWxYz",
+            ],
+        );
+    }
+
+    #[test]
+    fn archive_viewer_file_link_is_downloaded_directly() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let html = r#"<a href="https://archive.org/details/foo/Book%201.pdf#page=2">pdf</a>"#;
+        let found = extract_file_links(&Html::parse_document(html), &base, &["pdf"]);
+        assert_eq!(found[0].url, "https://archive.org/download/foo/Book%201.pdf");
+        assert_eq!(found[0].name, "Book 1.pdf");
     }
 }

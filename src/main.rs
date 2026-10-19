@@ -2,16 +2,22 @@
 //!
 //! # Subcommands
 //! ```text
-//! marcopolo scrape <URL> [OPTIONS]   — crawl a GitHub repo or any website
+//! marcopolo scrape <URL> [OPTIONS]   — crawl a GitHub repo, an archive.org
+//!                                      item/search page, a Google Drive file,
+//!                                      or any website
 //! marcopolo find   <QUERY> [OPTIONS] — search Archive.org, Open Library,
 //!                                      Gutenberg, Anna's Archive, GitHub,
 //!                                      Google Scholar, and DuckDuckGo
 //! ```
 
+mod archive_org;
 mod cli;
 mod download;
 mod find;
+mod google_drive;
 mod picker;
+mod progress;
+mod retry;
 mod scan;
 mod utils;
 mod web_scraper;
@@ -36,8 +42,11 @@ use reqwest::{header, Client};
 use serde::Deserialize;
 use url::Url;
 
+use archive_org::ArchiveLink;
 use download::{download_all, DownloadOpts};
+use google_drive::DriveLink;
 use picker::Item;
+use progress::{initial_checks, Progress, Status};
 use utils::parsing::{encode_path, filename_from_url, safe_filename, unique_filename};
 
 // ── Error alias ───────────────────────────────────────────────────────────────
@@ -107,6 +116,17 @@ pub fn matches_ext(path: &str, exts: &[&str]) -> bool {
 pub struct FileSource {
     pub name: String,
     pub url:  String,
+}
+
+/// What a scan turned up: files ready to download, plus links whose files
+/// still have to be looked up — archive.org item and search pages
+/// (`archive_org::resolve`) and Google Drive files and folders
+/// (`google_drive::resolve`).
+#[derive(Debug, Default)]
+pub struct Discovered {
+    pub files:   Vec<FileSource>,
+    pub archive: Vec<ArchiveLink>,
+    pub drive:   Vec<DriveLink>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,7 +307,9 @@ fn is_doc(path: &str) -> bool {
     matches_ext(name, DOC_EXTS) || name.to_lowercase().starts_with("readme")
 }
 
-/// Reads every doc file in the repo and collects the file links inside.
+/// Reads every doc file in the repo and collects the file links inside, plus
+/// links to archive.org item and search pages and to Google Drive files
+/// (those lead to files too).
 ///
 /// Repos like reading lists keep their PDF links in nested READMEs and notes,
 /// not just the root README, so all of them are searched.
@@ -297,7 +319,7 @@ async fn doc_links(
     blobs:   &[TreeEntry],
     exts:    &[&str],
     subpath: Option<&str>,
-) -> Vec<FileSource> {
+) -> Discovered {
     let docs: Vec<&TreeEntry> = blobs
         .iter()
         .filter(|e| in_subpath(&e.path, subpath) && is_doc(&e.path) && e.size <= MAX_DOC_BYTES)
@@ -330,12 +352,15 @@ async fn doc_links(
     }
 
     let mut seen  = HashSet::new();
-    texts
+    let files = texts
         .iter()
         .flatten()
         .flat_map(|text| extract_file_links(text, exts))
         .filter(|f| seen.insert(f.url.clone()))
-        .collect()
+        .collect();
+    let archive = texts.iter().flatten().flat_map(|text| extract_archive_links(text)).collect();
+    let drive = texts.iter().flatten().flat_map(|text| extract_drive_links(text)).collect();
+    Discovered { files, archive, drive }
 }
 
 async fn release_files(
@@ -375,24 +400,48 @@ async fn release_files(
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s\)\]"'<>]+"#).unwrap());
 
+/// Every URL in `text`, minus the sentence punctuation that trails a bare URL
+/// in prose.
+fn urls_in_text(text: &str) -> impl Iterator<Item = &str> {
+    URL_RE.find_iter(text).map(|m| m.as_str().trim_end_matches(['.', ',', ';', ':', '!']))
+}
+
 pub fn extract_file_links(text: &str, exts: &[&str]) -> Vec<FileSource> {
     // Grab every URL, then keep those whose *path* ends in a wanted extension.
     // Matching the extension inside the regex also hit `.md` in
     // `https://x.mdn.org/…` or `.doc` in `https://a.docs.rs/…`.
     let mut seen = HashSet::new();
 
-    URL_RE.find_iter(text)
-        .filter_map(|m| {
-            // Drop sentence punctuation that trails a bare URL in prose.
-            let raw    = m.as_str().trim_end_matches(['.', ',', ';', ':', '!']);
+    urls_in_text(text)
+        .filter_map(|raw| {
             let parsed = Url::parse(raw).ok()?;
             if !matches_ext(parsed.path(), exts) { return None; }
 
-            let url = github_raw_url(&parsed).unwrap_or_else(|| raw.to_owned());
+            // Viewer pages (GitHub `/blob/`, archive.org `/details/<id>/x.pdf`)
+            // become the raw file they show.
+            let url = github_raw_url(&parsed)
+                .or_else(|| archive_org::file_url(&parsed))
+                .unwrap_or_else(|| raw.to_owned());
             if !seen.insert(url.clone()) { return None; }
             let name = filename_from_url(&url).unwrap_or_else(|| "unknown".to_owned());
             Some(FileSource { name, url })
         })
+        .collect()
+}
+
+/// archive.org item and search pages linked in `text`. They are not files
+/// themselves; `archive_org::resolve` looks up the files they hold.
+pub fn extract_archive_links(text: &str) -> Vec<ArchiveLink> {
+    urls_in_text(text)
+        .filter_map(|raw| archive_org::parse_link(&Url::parse(raw).ok()?))
+        .collect()
+}
+
+/// Google Drive file and folder links in `text`. What they hold is only known
+/// once `google_drive::resolve` has asked Drive.
+pub fn extract_drive_links(text: &str) -> Vec<DriveLink> {
+    urls_in_text(text)
+        .filter_map(|raw| google_drive::parse_link(&Url::parse(raw).ok()?))
         .collect()
 }
 
@@ -546,7 +595,17 @@ async fn run() -> Result<()> {
                 );
             }
 
-            let mut all: Vec<FileSource> = if is_github_url(&url) {
+            // An archive.org item/search page or a Google Drive file/folder is
+            // looked up directly instead of being crawled like a website.
+            let parsed = Url::parse(&url).ok();
+            let archive_link = parsed.as_ref().and_then(archive_org::parse_link);
+            let drive_link = parsed.as_ref().and_then(google_drive::parse_link);
+
+            let found: Discovered = if let Some(link) = archive_link {
+                Discovered { archive: vec![link], ..Discovered::default() }
+            } else if let Some(link) = drive_link {
+                Discovered { drive: vec![link], ..Discovered::default() }
+            } else if is_github_url(&url) {
                 let (owner, repo, subpath, branch_from_url) = parse_github_url(&url)?;
 
                 if !quiet {
@@ -569,23 +628,23 @@ async fn run() -> Result<()> {
                 );
 
                 // Committed files first, then links found in docs, then release assets.
-                let mut found: Vec<FileSource> = Vec::new();
+                let mut found = Discovered::default();
                 match tree_r {
                     Ok(blobs) => {
-                        found.extend(tree_files(&repo_ref, &blobs, &exts, sp));
-                        found.extend(doc_links(&gh_client, &repo_ref, &blobs, &exts, sp).await);
+                        found.files.extend(tree_files(&repo_ref, &blobs, &exts, sp));
+                        let docs = doc_links(&gh_client, &repo_ref, &blobs, &exts, sp).await;
+                        found.files.extend(docs.files);
+                        found.archive = docs.archive;
+                        found.drive = docs.drive;
                     }
                     // Surface failures (e.g. 403 rate limit) instead of
                     // silently reporting "No files found."
                     Err(e) => eprintln!("{} repo tree scan failed: {e}", "warning:".yellow()),
                 }
                 match releases_r {
-                    Ok(assets) => found.extend(assets),
+                    Ok(assets) => found.files.extend(assets),
                     Err(e) => eprintln!("{} releases scan failed: {e}", "warning:".yellow()),
                 }
-
-                let mut seen = HashSet::new();
-                found.retain(|f| seen.insert(f.url.clone()));
                 found
             } else {
                 if !quiet {
@@ -597,6 +656,31 @@ async fn run() -> Result<()> {
                 }
                 web_scraper::scrape_files(&client, &url, depth, &exts).await?
             };
+
+            // archive.org links found above stand for items, Drive links for
+            // folders or files of unknown name and type; look them up and add
+            // the files of the wanted types to the list.
+            let Discovered { files: mut all, archive, drive } = found;
+            if !archive.is_empty() {
+                if !quiet {
+                    println!(
+                        "{} looking up the files behind {} archive.org link(s) …",
+                        "→".dimmed(), archive.len().to_string().cyan(),
+                    );
+                }
+                all.extend(archive_org::resolve(&client, &archive, &exts, quiet).await);
+            }
+            if !drive.is_empty() {
+                if !quiet {
+                    println!(
+                        "{} looking up {} Google Drive link(s) …",
+                        "→".dimmed(), drive.len().to_string().cyan(),
+                    );
+                }
+                all.extend(google_drive::resolve(&client, &drive, &exts, quiet).await);
+            }
+            let mut seen = HashSet::new();
+            all.retain(|f| seen.insert(f.url.clone()));
 
             if let Some(ref kw) = filter {
                 let kw_lower = kw.to_lowercase();
@@ -643,14 +727,51 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            // On a real terminal, show every file pre-checked and let the user
-            // untick what they don't want before anything is downloaded.
+            // An earlier run into the same folder (stopped by Ctrl-C, or with
+            // failed downloads) is continued: finished files are left out and
+            // the rest pick up where they stopped (see `progress.rs`).
+            let progress = Progress::load(&out);
+            let statuses: Vec<Status> = all.iter().map(|f| progress.status(f)).collect();
+            let done    = statuses.iter().filter(|s| s.is_done()).count();
+            let partial = statuses.iter().filter(|s| **s == Status::Partial).count();
+            let waiting = statuses.iter().filter(|s| matches!(s, Status::InQuarantine(_))).count();
+            if !quiet && done + partial + waiting > 0 {
+                let parts: Vec<String> = [
+                    (done, "already downloaded"),
+                    (partial, "partly downloaded"),
+                    (waiting, "downloaded but not yet scanned"),
+                ]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} {what}"))
+                .collect();
+                println!(
+                    "{} continuing the earlier run in {}: {}",
+                    "↻".cyan().bold(), out.display().to_string().cyan(), parts.join(", "),
+                );
+            }
+            all = all.into_iter().zip(&statuses).filter(|(_, s)| !s.is_done()).map(|(f, _)| f).collect();
+            if all.is_empty() {
+                if !quiet {
+                    println!("{} everything is already downloaded → {}", "✓".green().bold(), out.display());
+                }
+                return Ok(());
+            }
+
+            // On a real terminal, show the files checked and let the user
+            // untick what they don't want before anything is downloaded. When
+            // continuing, the files picked last time start checked.
             if !quiet && picker::is_interactive() {
                 let items: Vec<Item> = all
                     .iter()
                     .map(|f| Item { label: Cow::Borrowed(f.name.as_str()), link: &f.url })
                     .collect();
-                let Some(chosen) = picker::pick("Select files to download", &items, true)? else {
+                let title = if all.iter().any(|f| progress.was_planned(f)) {
+                    "Select files to download — checked: picked last time, not finished yet"
+                } else {
+                    "Select files to download"
+                };
+                let Some(chosen) = picker::pick(title, &items, initial_checks(&all, &progress))? else {
                     println!("{} nothing downloaded.", "✗".dimmed());
                     return Ok(());
                 };
@@ -772,7 +893,7 @@ async fn run() -> Result<()> {
                     })
                     .collect();
                 let title = format!("{} result(s) for \"{query}\" — check what to download", results.len());
-                let Some(chosen) = picker::pick(&title, &items, false)? else {
+                let Some(chosen) = picker::pick(&title, &items, vec![false; items.len()])? else {
                     println!("{} nothing downloaded.", "✗".dimmed());
                     return Ok(());
                 };
@@ -868,7 +989,10 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_file_links, is_github_url, matches_ext, parse_github_url, parse_selection};
+    use super::{
+        extract_archive_links, extract_drive_links, extract_file_links, is_github_url, matches_ext,
+        parse_github_url, parse_selection, ArchiveLink, DriveLink,
+    };
 
     #[test]
     fn select_single() { assert_eq!(parse_selection("1", 5), vec![0]); }
@@ -928,5 +1052,59 @@ mod tests {
         let urls: Vec<_> = found.iter().map(|f| f.url.as_str()).collect();
         assert_eq!(urls, ["https://x.org/files/book.md", "https://x.org/a.pdf"]);
         assert_eq!(found[0].name, "book.md");
+    }
+
+    #[test]
+    fn archive_viewer_file_links_become_download_links() {
+        let text = "[pdf](https://archive.org/details/foo/Some%20Book.pdf)";
+        let found = extract_file_links(text, &["pdf"]);
+        assert_eq!(found[0].url, "https://archive.org/download/foo/Some%20Book.pdf");
+        assert_eq!(found[0].name, "Some Book.pdf");
+    }
+
+    #[test]
+    fn archive_links_found_in_markdown() {
+        // Shapes taken from github.com/valeman/Awesome_Math_Books.
+        let text = "\
+            - [Vilenkin](https://archive.org/details/VilenkinCombinatorialMathematics)
+            - [Voyevodin](https://archive.org/details/VoyevodinLinearAlgebraMir1983](https://mega.nz/file/x)
+            - [Nikolsky](https://archive.org/details/nikolsky-vol-1-mir?utm_source=chatgpt.com)
+            - [Rudin](https://archive.org/details/principlesofmath00rudi/page/n9/mode/2up).
+            - more by [Smirnov](https://archive.org/search?query=creator%3A%22V.+I.+Smirnov%22)
+            - [file](https://archive.org/download/foo/foo.pdf) [shop](https://example.com/details/x)";
+        assert_eq!(
+            extract_archive_links(text),
+            [
+                ArchiveLink::Item("VilenkinCombinatorialMathematics".into()),
+                ArchiveLink::Item("VoyevodinLinearAlgebraMir1983".into()),
+                ArchiveLink::Item("nikolsky-vol-1-mir".into()),
+                ArchiveLink::Item("principlesofmath00rudi".into()),
+                ArchiveLink::Search("creator:\"V. I. Smirnov\"".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn drive_links_found_in_markdown() {
+        let text = "\
+            - [Optimization](https://drive.google.com/file/d/1Rx7MAekKZbyNVc5B2MNfR0HXXIEJCksp/view?usp=sharing)
+            - <https://drive.google.com/open?id=1l_5RK28JRL19wpT22B-DY9We3TVXnnQQ>.
+            - [folder](https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz?usp=sharing)
+            - [doc](https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit)";
+        let found: Vec<(bool, String)> = extract_drive_links(text)
+            .into_iter()
+            .map(|l| match l {
+                DriveLink::File(f) => (false, f.id),
+                DriveLink::Folder(f) => (true, f.id),
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (false, "1Rx7MAekKZbyNVc5B2MNfR0HXXIEJCksp".to_owned()),
+                (false, "1l_5RK28JRL19wpT22B-DY9We3TVXnnQQ".to_owned()),
+                (true, "1AbCdEfGhIjKlMnOpQrStUvWxYz".to_owned()),
+            ],
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! All pure logic lives here — network code stays in `find/`.
 
 pub mod dedup;
+pub mod listing;
 pub mod parsing;
 pub mod relevance;
 pub mod slug;

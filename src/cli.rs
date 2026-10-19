@@ -27,9 +27,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Scrape a GitHub repo or any website for files to download.
+    /// Scrape a GitHub repo, an archive.org item/search page, a Google Drive file, or any website for files to download.
+    ///
+    /// archive.org item/search pages and Google Drive files linked from the
+    /// repo or website are looked up too, and the public files behind them are
+    /// offered for download.
     Scrape {
-        /// GitHub repo URL or any website URL to crawl.
+        /// GitHub repo URL, archive.org item/search URL, Google Drive file URL, or any website URL to crawl.
         url: String,
 
         /// File types to hunt (repeatable: --type pdf --type img)
@@ -54,7 +58,8 @@ pub enum Command {
         #[arg(long)]
         delay: Option<u64>,
 
-        /// Resume partial (.part) downloads and skip files already downloaded.
+        /// Also skip any same-named file in the output folder and resume any .part file, even ones from before
+        /// marcopolo kept progress. (Progress it recorded is always continued: just run the same command again.)
         #[arg(long = "continue", default_value_t = false)]
         resume: bool,
 

@@ -33,16 +33,18 @@ pub fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-/// Shows `items` as a checkbox list and waits for the user.
+/// Shows `items` as a checkbox list and waits for the user. `checked` says
+/// which items start checked, one per item (missing ones start unchecked).
 ///
 /// Returns the checked indices in list order, or `None` when cancelled.
-pub fn pick(title: &str, items: &[Item], checked_by_default: bool) -> io::Result<Option<Vec<usize>>> {
+pub fn pick(title: &str, items: &[Item], mut checked: Vec<bool>) -> io::Result<Option<Vec<usize>>> {
     if items.is_empty() {
         return Ok(Some(Vec::new()));
     }
     let term = Term::stdout();
     let _cursor = HiddenCursor::new(&term)?;
-    let mut state = ListState::new(items.len(), checked_by_default);
+    checked.resize(items.len(), false);
+    let mut state = ListState::new(checked);
     let mut drawn = 0;
 
     loop {
@@ -135,8 +137,8 @@ struct ListState {
 }
 
 impl ListState {
-    fn new(len: usize, checked_by_default: bool) -> Self {
-        Self { checked: vec![checked_by_default; len], cursor: 0, top: 0, expanded: None }
+    fn new(checked: Vec<bool>) -> Self {
+        Self { checked, cursor: 0, top: 0, expanded: None }
     }
 
     /// Applies one action; `page` is how many entries fit on screen.
@@ -338,7 +340,7 @@ mod tests {
 
     #[test]
     fn toggle_and_confirm() {
-        let mut s = ListState::new(3, true);
+        let mut s = ListState::new(vec![true; 3]);
         assert_eq!(s.apply(Action::Down, 10), Step::Stay);
         s.apply(Action::Toggle, 10);
         assert_eq!(s.apply(Action::Confirm, 10), Step::Confirmed(vec![0, 2]));
@@ -346,7 +348,7 @@ mod tests {
 
     #[test]
     fn toggle_all_flips_between_all_and_none() {
-        let mut s = ListState::new(3, false);
+        let mut s = ListState::new(vec![false; 3]);
         s.apply(Action::Toggle, 10); // one checked → "a" checks all
         s.apply(Action::ToggleAll, 10);
         assert_eq!(s.chosen(), vec![0, 1, 2]);
@@ -356,7 +358,7 @@ mod tests {
 
     #[test]
     fn cursor_stays_in_bounds() {
-        let mut s = ListState::new(3, false);
+        let mut s = ListState::new(vec![false; 3]);
         s.apply(Action::Up, 10);
         assert_eq!(s.cursor, 0);
         s.apply(Action::PageDown, 10);
@@ -369,7 +371,7 @@ mod tests {
 
     #[test]
     fn enter_expands_and_collapses() {
-        let mut s = ListState::new(2, false);
+        let mut s = ListState::new(vec![false; 2]);
         s.apply(Action::Expand, 10);
         assert_eq!(s.expanded, Some(0));
         s.apply(Action::Down, 10);
@@ -389,7 +391,7 @@ mod tests {
 
     #[test]
     fn scrolls_to_keep_cursor_visible() {
-        let mut s = ListState::new(100, false);
+        let mut s = ListState::new(vec![false; 100]);
         s.cursor = 50;
         s.scroll_into_view(10);
         assert_eq!(s.top, 41);
@@ -423,7 +425,7 @@ mod tests {
         let long = "https://example.com/a/very/long/path/that/goes/on/and/on/forever/and/ever/book.pdf";
         let list = items(&[long; 50]);
         let screen = Screen { rows: 12, cols: 40 };
-        let mut s = ListState::new(list.len(), true);
+        let mut s = ListState::new(vec![true; list.len()]);
         s.expanded = Some(0);
         let rows = list_rows(&s, &list, screen);
         s.scroll_into_view(rows);
@@ -439,7 +441,7 @@ mod tests {
     fn render_tiny_terminal_still_shows_cursor_row() {
         let list = items(&["https://a.org/x.pdf"; 5]);
         let screen = Screen { rows: 1, cols: 5 };
-        let s = ListState::new(5, false);
+        let s = ListState::new(vec![false; 5]);
         let rows = list_rows(&s, &list, screen);
         assert_eq!(rows, 1);
         assert_eq!(render(&s, "Pick", &list, screen, rows).len(), 3);

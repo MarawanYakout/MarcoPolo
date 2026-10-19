@@ -12,8 +12,14 @@
 //! - With scanning on, finished files wait in `<out>/quarantine/` until one
 //!   ClamAV run over the batch clears them (see `scan.rs`). Files ClamAV
 //!   finds malware in are deleted.
+//! - A download that is byte-for-byte the same as an earlier file in the list
+//!   (the same book reached through two links) is deleted; the first stays.
+//! - Progress is journaled in the output folder (see `progress.rs`): running
+//!   the same command after Ctrl-C skips finished files, resumes `.part`
+//!   files, scans files that never got scanned, and retries failed ones.
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fmt::Write as _,
     path::{Path, PathBuf},
@@ -26,10 +32,11 @@ use indicatif::{
     HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle,
 };
 use reqwest::{header, Client, Response, StatusCode};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
 use crate::{
     matches_ext,
+    progress::{Event, Journal, Progress, Status},
     scan::{self, Verdict},
     FileSource, Result,
 };
@@ -85,7 +92,16 @@ enum Outcome {
     Quarantined(String),
     /// ClamAV found malware and the file was deleted; holds the signature name.
     Deleted(String),
+    /// Byte-for-byte the same as an earlier file and deleted; holds that
+    /// file's name.
+    Duplicate(String),
 }
+
+/// One file's result: the file, when it finished (for the log), and what happened.
+type FileResult<'a> = (&'a FileSource, String, Result<Outcome>);
+
+/// Bytes read from each file per step when comparing two files.
+const COMPARE_BLOCK: usize = 256 * 1024;
 
 /// Downloads `files` into `out` and prints/logs the result of each one.
 ///
@@ -136,16 +152,32 @@ pub async fn download_all(
     let pacer   = Pacer::new(opts.delay_ms);
     let started = Instant::now();
 
-    let mut results: Vec<(&FileSource, String, Result<Outcome>)> = stream::iter(files)
-        .map(|src| {
-            let (mp, overall, pacer) = (&mp, &overall, &pacer);
+    // What an earlier, interrupted run into this folder already did, and the
+    // journal this run adds to (so it can be continued in turn).
+    let progress = Progress::load(out);
+    let journal  = Journal::open(out);
+    journal.record(&files.iter().map(Event::planned).collect::<Vec<_>>());
+
+    let mut finished: Vec<(usize, FileResult)> = stream::iter(files.iter().enumerate())
+        .map(|(i, src)| {
+            let (mp, overall, pacer, progress, journal) = (&mp, &overall, &pacer, &progress, &journal);
             async move {
                 let c = if src.url.starts_with("https://raw.githubusercontent.com/") {
                     gh_client
                 } else {
                     client
                 };
-                let r = download_one(c, src, out, land_in, opts, pacer, mp).await;
+                let job = |resume| Job { src, out, land_in, resume };
+                let r = match progress.status(src) {
+                    Status::Saved            => Ok(Outcome::Skipped),
+                    Status::Duplicate(of)    => Ok(Outcome::Duplicate(of)),
+                    Status::InQuarantine(sz) => reuse_unscanned(src, out, land_in, sz).await,
+                    Status::Partial          => download_one(c, &job(true), opts, pacer, mp).await,
+                    Status::New              => download_one(c, &job(opts.resume), opts, pacer, mp).await,
+                };
+                if let Ok(Outcome::Downloaded(size)) = &r {
+                    journal.record(&[Event::done(src, *size)]);
+                }
                 match &r {
                     Ok(Outcome::Downloaded(size)) => {
                         let _ = mp.println(format!(
@@ -159,15 +191,15 @@ pub async fn download_all(
                             "·".dimmed(), src.name.dimmed(), "already downloaded".dimmed(),
                         ));
                     }
-                    // Only set later, by the scan.
-                    Ok(Outcome::Quarantined(_) | Outcome::Deleted(_)) => {}
+                    // Only set later, by the duplicate check and the scan.
+                    Ok(Outcome::Quarantined(_) | Outcome::Deleted(_) | Outcome::Duplicate(_)) => {}
                     // Errors are shown even in --quiet mode.
                     Err(e) => mp.suspend(|| {
                         eprintln!("  {} {}: {e}", "✗".red().bold(), src.name);
                     }),
                 }
                 overall.inc(1);
-                (src, utc_now(), r)
+                (i, (src, utc_now(), r))
             }
         })
         .buffer_unordered(opts.jobs.max(1))
@@ -176,13 +208,21 @@ pub async fn download_all(
 
     overall.finish_and_clear();
 
+    // Downloads finish in any order; put them back in list order so "the
+    // first copy" below means the first one in the list.
+    finished.sort_unstable_by_key(|(i, _)| *i);
+    let mut results: Vec<FileResult> = finished.into_iter().map(|(_, r)| r).collect();
+
+    // Before the scan: one copy is enough, and ClamAV then has less to check.
+    remove_duplicates(&mut results, out, land_in, &journal, opts.quiet).await;
+
     if scanning {
         let clamav = clamav.as_deref().unwrap_or("ClamAV");
         scan_and_release(&mut results, out, &quarantine, clamav, opts.quiet).await;
     }
 
     let (mut ok, mut skipped, mut failed, mut bytes) = (0usize, 0usize, 0usize, 0u64);
-    let (mut quarantined, mut deleted) = (0usize, 0usize);
+    let (mut quarantined, mut deleted, mut duplicates) = (0usize, 0usize, 0usize);
     let mut log = String::new();
     for (src, stamp, r) in &results {
         let status = match r {
@@ -190,6 +230,7 @@ pub async fn download_all(
             Ok(Outcome::Skipped)          => { skipped += 1; "ok (already downloaded)".to_owned() }
             Ok(Outcome::Quarantined(why)) => { quarantined += 1; format!("quarantined ({why})") }
             Ok(Outcome::Deleted(sig))     => { deleted += 1; format!("deleted (malware {sig}, detected by ClamAV)") }
+            Ok(Outcome::Duplicate(of))    => { duplicates += 1; format!("deleted (identical to {of})") }
             Err(e)                        => { failed += 1; format!("error: {e}") }
         };
         let _ = writeln!(log, "[{stamp}] {status}  {}  {}", src.name, src.url);
@@ -211,6 +252,9 @@ pub async fn download_all(
         );
         if skipped > 0 {
             println!("{} {} already downloaded, skipped", "·".dimmed(), skipped);
+        }
+        if duplicates > 0 {
+            println!("{} {} identical copy/copies deleted, the first one kept", "·".dimmed(), duplicates);
         }
         if failed > 0 {
             println!("{} {} download(s) failed", "✗".red().bold(), failed.to_string().red());
@@ -236,18 +280,28 @@ pub async fn download_all(
     Ok(Summary { failed, quarantined, deleted })
 }
 
-/// Downloads one file via its `.part` file and moves it into `land_in`
-/// (`out`, or the quarantine folder when scanning).
+/// One file to download, and where it goes.
+struct Job<'a> {
+    src:     &'a FileSource,
+    out:     &'a Path,
+    /// Where the finished file is moved: `out`, or quarantine when scanning.
+    land_in: &'a Path,
+    /// Continue the `.part` file left by an earlier, interrupted run.
+    resume:  bool,
+}
+
+/// Downloads one file via its `.part` file and moves it into `job.land_in`.
 async fn download_one(
-    client:  &Client,
-    src:     &FileSource,
-    out:     &Path,
-    land_in: &Path,
-    opts:    &DownloadOpts,
-    pacer:   &Pacer,
-    mp:      &MultiProgress,
+    client: &Client,
+    job:    &Job<'_>,
+    opts:   &DownloadOpts,
+    pacer:  &Pacer,
+    mp:     &MultiProgress,
 ) -> Result<Outcome> {
-    let dest = out.join(&src.name);
+    let src  = job.src;
+    let dest = job.out.join(&src.name);
+    // `--continue` trusts any same-named file, even one from before marcopolo
+    // kept a progress journal.
     if opts.resume && tokio::fs::try_exists(&dest).await.unwrap_or(false) {
         return Ok(Outcome::Skipped);
     }
@@ -256,15 +310,147 @@ async fn download_one(
     let pb = mp.add(ProgressBar::new_spinner());
     pb.set_style(spinner_style());
     pb.set_message(src.name.clone());
-    let fetched = fetch_to_part(client, src, &part, opts, pacer, &pb).await;
+    let fetched = fetch_to_part(client, src, &part, job.resume, opts, pacer, &pb).await;
     pb.finish_and_clear();
     mp.remove(&pb);
     fetched?;
 
-    let saved = land_in.join(&src.name);
+    let saved = job.land_in.join(&src.name);
     tokio::fs::rename(&part, &saved).await?;
     let size = tokio::fs::metadata(&saved).await.map(|m| m.len()).unwrap_or(0);
     Ok(Outcome::Downloaded(size))
+}
+
+/// A file an earlier run downloaded but stopped before scanning: it waits in
+/// quarantine. It joins this run's scan without being downloaded again — or,
+/// with scanning off now, is moved into `out` like any unscanned download.
+async fn reuse_unscanned(src: &FileSource, out: &Path, land_in: &Path, size: u64) -> Result<Outcome> {
+    let waiting = out.join(scan::QUARANTINE_DIR).join(&src.name);
+    let target  = land_in.join(&src.name);
+    if waiting != target {
+        tokio::fs::rename(&waiting, &target).await?;
+    }
+    Ok(Outcome::Downloaded(size))
+}
+
+/// A finished file the duplicate check looks at.
+struct OnDisk {
+    /// Position in the download list (and in `results`).
+    idx:  usize,
+    path: PathBuf,
+    size: u64,
+    /// `false` for a file kept from an earlier `--continue` run: never deleted.
+    new:  bool,
+}
+
+/// Deletes downloads that are byte-for-byte the same as an earlier file in
+/// the list — the same book reached through two links (a mirror, a re-upload,
+/// two search results) — and keeps the first copy.
+///
+/// Only files of equal size are compared, so this costs nothing in the usual
+/// case. Files kept from an earlier `--continue` run always win, so a rerun
+/// can't bring a deleted copy back.
+async fn remove_duplicates(
+    results: &mut [FileResult<'_>],
+    out:     &Path,
+    land_in: &Path,
+    journal: &Journal,
+    quiet:   bool,
+) {
+    let mut files: Vec<OnDisk> = Vec::with_capacity(results.len());
+    for (idx, (src, _, r)) in results.iter().enumerate() {
+        match r {
+            Ok(Outcome::Downloaded(size)) => {
+                files.push(OnDisk { idx, path: land_in.join(&src.name), size: *size, new: true });
+            }
+            Ok(Outcome::Skipped) => {
+                let path = out.join(&src.name);
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    files.push(OnDisk { idx, path, size: meta.len(), new: false });
+                }
+            }
+            Ok(Outcome::Quarantined(_) | Outcome::Deleted(_) | Outcome::Duplicate(_)) | Err(_) => {}
+        }
+    }
+    // Earlier runs' files first (`false` < `true`), then list order.
+    files.sort_by_key(|f| (f.new, f.idx));
+
+    let mut by_size: HashMap<u64, Vec<&OnDisk>> = HashMap::new();
+    for f in &files {
+        by_size.entry(f.size).or_default().push(f);
+    }
+
+    // (duplicate, the earlier file it copies) — applied below, once the
+    // comparisons no longer borrow `results`.
+    let mut copies: Vec<(&OnDisk, &OnDisk)> = Vec::new();
+    for group in by_size.values().filter(|g| g.len() > 1) {
+        let mut firsts: Vec<&OnDisk> = Vec::with_capacity(group.len());
+        for &f in group {
+            let mut original = None;
+            if f.new {
+                for &first in &firsts {
+                    // A file that can't be read is treated as different: when
+                    // unsure, keep both.
+                    if same_content(&first.path, &f.path).await.unwrap_or(false) {
+                        original = Some(first);
+                        break;
+                    }
+                }
+            }
+            match original {
+                Some(first) => copies.push((f, first)),
+                None => firsts.push(f),
+            }
+        }
+    }
+    copies.sort_by_key(|(dup, _)| dup.idx);
+
+    for (dup, first) in copies {
+        let first_name = results[first.idx].0.name.clone();
+        let (src, _, r) = &mut results[dup.idx];
+        match tokio::fs::remove_file(&dup.path).await {
+            Ok(()) => {
+                if !quiet {
+                    println!(
+                        "  {} {}  {}",
+                        "=".cyan().bold(), src.name, format!("identical to {first_name} — deleted").dimmed(),
+                    );
+                }
+                journal.record(&[Event::duplicate(src, &first_name)]);
+                *r = Ok(Outcome::Duplicate(first_name));
+            }
+            Err(e) => eprintln!(
+                "{} \"{}\" is identical to \"{first_name}\", but deleting it failed: {e}",
+                "warning:".yellow(), src.name,
+            ),
+        }
+    }
+}
+
+/// `true` when files `a` and `b` hold the same bytes. Both are read in step,
+/// a block at a time, so even huge files never sit in memory, and reading
+/// stops at the first difference.
+async fn same_content(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (mut file_a, mut file_b) = (tokio::fs::File::open(a).await?, tokio::fs::File::open(b).await?);
+    let (mut block_a, mut block_b) = (vec![0u8; COMPARE_BLOCK], vec![0u8; COMPARE_BLOCK]);
+    loop {
+        let len_a = read_block(&mut file_a, &mut block_a).await?;
+        let len_b = read_block(&mut file_b, &mut block_b).await?;
+        if block_a[..len_a] != block_b[..len_b] { return Ok(false); }
+        if len_a == 0 { return Ok(true); }
+    }
+}
+
+/// Fills `buf` as far as the file allows (one `read` may return less) and
+/// returns how many bytes it holds; 0 means the end of the file.
+async fn read_block(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 { break; }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Scans the quarantine folder with one ClamAV run, then per file:
@@ -274,7 +460,7 @@ async fn download_one(
 /// Prints the scan result: a header, one line per file and the totals.
 /// With `quiet`, only deleted and quarantined files are printed.
 async fn scan_and_release(
-    results:    &mut [(&FileSource, String, Result<Outcome>)],
+    results:    &mut [FileResult<'_>],
     out:        &Path,
     quarantine: &Path,
     clamav:     &str,
@@ -382,11 +568,13 @@ fn keep_in_quarantine(r: &mut Result<Outcome>, name: &str, why: String) {
     *r = Ok(Outcome::Quarantined(why));
 }
 
-/// Fetches `src` into `part`, retrying transient failures.
+/// Fetches `src` into `part`, retrying transient failures. With `resume`,
+/// bytes already in `part` are kept and only the rest is requested.
 async fn fetch_to_part(
     client: &Client,
     src:    &FileSource,
     part:   &Path,
+    resume: bool,
     opts:   &DownloadOpts,
     pacer:  &Pacer,
     pb:     &ProgressBar,
@@ -401,9 +589,9 @@ async fn fetch_to_part(
         }
         pacer.wait().await;
 
-        // Continue an existing .part file when --continue is set, and always
-        // on a retry (those bytes then came from this run's earlier attempt).
-        let existing = if opts.resume || attempt > 0 {
+        // Continue an existing .part file when resuming, and always on a
+        // retry (those bytes then came from this run's earlier attempt).
+        let existing = if resume || attempt > 0 {
             tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0)
         } else {
             0
@@ -533,7 +721,7 @@ fn range_starts_at(resp: &Response, start: u64) -> bool {
 }
 
 /// `book.pdf` → `book.pdf.part`
-fn part_path(dest: &Path) -> PathBuf {
+pub fn part_path(dest: &Path) -> PathBuf {
     let mut name = OsString::from(dest.as_os_str());
     name.push(".part");
     PathBuf::from(name)
@@ -632,6 +820,101 @@ mod tests {
     #[test]
     fn part_path_appends_suffix() {
         assert_eq!(part_path(Path::new("out/book.pdf")), PathBuf::from("out/book.pdf.part"));
+    }
+
+    /// A fresh, empty folder for one test, removed by the test at the end.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("marcopolo-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn source(name: &str) -> FileSource {
+        FileSource { name: name.to_owned(), url: format!("https://x.org/{name}") }
+    }
+
+    #[tokio::test]
+    async fn same_content_compares_bytes() {
+        let dir = test_dir("same-content");
+        // Larger than one block, so the block-by-block loop is exercised.
+        let big: Vec<u8> = (0..COMPARE_BLOCK * 2 + 7).map(|i| (i % 251) as u8).collect();
+        let mut big_changed = big.clone();
+        *big_changed.last_mut().unwrap() ^= 1; // differs only in the last byte
+        for (name, bytes) in [
+            ("a", big.as_slice()), ("b", big.as_slice()), ("c", big_changed.as_slice()),
+            ("short", &big[..10]), ("empty1", &[][..]), ("empty2", &[][..]),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        async fn same(dir: &Path, x: &str, y: &str) -> std::io::Result<bool> {
+            same_content(&dir.join(x), &dir.join(y)).await
+        }
+        assert!(same(&dir, "a", "b").await.unwrap());
+        assert!(!same(&dir, "a", "c").await.unwrap());
+        assert!(!same(&dir, "a", "short").await.unwrap());
+        assert!(!same(&dir, "short", "a").await.unwrap());
+        assert!(same(&dir, "empty1", "empty2").await.unwrap());
+        assert!(same(&dir, "a", "missing").await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicates_deleted_first_copy_kept() {
+        let dir = test_dir("duplicates");
+        for (name, bytes) in [
+            ("book.pdf", "same bytes"), ("book_1.pdf", "same bytes"), ("mirror.pdf", "same bytes"),
+            ("other.pdf", "diff bytes"), // same size, different content
+            ("small.pdf", "tiny"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let srcs: Vec<FileSource> =
+            ["book.pdf", "book_1.pdf", "other.pdf", "small.pdf", "mirror.pdf"].into_iter().map(source).collect();
+        let mut results: Vec<FileResult> =
+            srcs.iter().map(|s| (s, String::new(), Ok(Outcome::Downloaded(10)))).collect();
+        results[3].2 = Ok(Outcome::Downloaded(4));
+
+        remove_duplicates(&mut results, &dir, &dir, &Journal::disabled(), true).await;
+
+        let state: Vec<String> = results
+            .iter()
+            .map(|(_, _, r)| match r {
+                Ok(Outcome::Downloaded(_)) => "kept".to_owned(),
+                Ok(Outcome::Duplicate(of)) => format!("copy of {of}"),
+                _ => "other".to_owned(),
+            })
+            .collect();
+        assert_eq!(state, ["kept", "copy of book.pdf", "kept", "kept", "copy of book.pdf"]);
+        assert!(dir.join("book.pdf").exists());
+        assert!(!dir.join("book_1.pdf").exists());
+        assert!(!dir.join("mirror.pdf").exists());
+        assert!(dir.join("other.pdf").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_from_earlier_run_wins() {
+        // `--continue`: `old.pdf` is already in `out`, listed *after* the new
+        // download with the same bytes. The old one stays, the new one goes.
+        let out = test_dir("earlier-run");
+        let land_in = out.join("quarantine");
+        std::fs::create_dir_all(&land_in).unwrap();
+        std::fs::write(land_in.join("new.pdf"), "same").unwrap();
+        std::fs::write(out.join("old.pdf"), "same").unwrap();
+        let srcs = [source("new.pdf"), source("old.pdf")];
+        let mut results: Vec<FileResult> = vec![
+            (&srcs[0], String::new(), Ok(Outcome::Downloaded(4))),
+            (&srcs[1], String::new(), Ok(Outcome::Skipped)),
+        ];
+
+        remove_duplicates(&mut results, &out, &land_in, &Journal::disabled(), true).await;
+
+        assert!(matches!(&results[0].2, Ok(Outcome::Duplicate(of)) if of == "old.pdf"));
+        assert!(matches!(results[1].2, Ok(Outcome::Skipped)));
+        assert!(!land_in.join("new.pdf").exists());
+        assert!(out.join("old.pdf").exists());
+        std::fs::remove_dir_all(&out).unwrap();
     }
 
     #[test]

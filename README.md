@@ -106,6 +106,49 @@ Marcopolo operates in two modes depending on the URL you give it:
 2. BFS-crawls from the landing page up to `--depth` levels deep
 3. Only follows same-origin links — never crawls external sites
 
+**archive.org links** — in both modes, links to [archive.org](https://archive.org)
+pages are looked up too, because the page is not the file:
+- `archive.org/details/<id>` (also `/stream/`, `/embed/`, and viewer links
+  like `…/page/n9/mode/2up`) is an *item* — one book with several files. Its
+  file list comes from archive.org's Metadata API and the public files of the
+  wanted type are added to the list.
+- `archive.org/search?query=…` is a search; its first 50 items are used.
+- `archive.org/details/<id>/book.pdf` is one file and is downloaded directly.
+
+An item usually holds the uploaded book plus copies archive.org made from it
+(an OCR'd `_text.pdf`, a grayscale `_bw.pdf`); only one version of each book
+is listed. Duplicates are skipped too:
+- an older copy an uploader left in a sub-folder (`del/book.pdf` next to
+  `book.pdf`) — the file at the item's root wins. Same-named files that are
+  all in sub-folders (`vol1/book.pdf`, `vol2/book.pdf`) are different files
+  and are kept;
+- byte-identical copies in different items (same SHA-1, as listed by
+  archive.org — no download needed to tell).
+
+Two scans of the same book are different files, so they are both listed
+(e.g. a full-size and a small upload) — untick the one you don't want.
+
+Items that can't give a file are explained, not silently dropped:
+lend-only books (borrow-only on archive.org, they answer 403), dead links
+(the item was removed), and items without the wanted file type.
+
+**Google Drive links** — in both modes, links to Drive files and folders are
+followed too. Files: `drive.google.com/file/d/<id>/view` (also `/preview`, `/edit`),
+`drive.google.com/open?id=…`, `drive.google.com/uc?id=…`, and Drive viewers
+embedded in a web page (`<iframe>`). A share link doesn't say what the file
+is, so marcopolo asks Drive for the file's first byte: the answer gives the
+real filename (`optimization.pdf`), which is then checked against `--type`.
+Large files (over ~100 MB) download without Drive's "can't scan for viruses"
+page — marcopolo scans with ClamAV itself. Files that are private, deleted or
+over Drive's download limit are listed in a note.
+
+Folders (`drive.google.com/drive/folders/<id>`, also embedded folder views)
+are listed with sub-folders, up to 100 folders and 10 levels deep. The
+listing already names every file, so files inside folders need no extra
+request: the `--type` files go into the list, the rest are named in a note.
+Private or deleted folders are noted too. Google Docs/Sheets/Slides are not
+files and are skipped.
+
 All discovered files are deduplicated by URL, then downloaded concurrently
 (4 at a time by default, see `--jobs`) into `./downloads/`. Files with the same
 name get `_1`, `_2`, … suffixes instead of overwriting each other.
@@ -129,6 +172,35 @@ everything is downloaded as before.
 Each file streams to `<name>.part` and is renamed only when complete, so an
 interrupted run never leaves a truncated file behind under the real name.
 
+**No duplicate files** — when two links give the same file (a mirror, a
+re-upload, two search results), the copies are compared byte by byte after
+download and only the first one in the list is kept; the rest are deleted
+before the malware scan and logged as `deleted (identical to …)`. Only files
+of equal size are compared, so this costs nothing in the usual case. Files
+already in the folder from an earlier run always win.
+
+**Stopped? Run the same command again** — marcopolo keeps a small progress
+journal in the output folder (`.marcopolo-progress.jsonl`), written as it
+goes, so it survives Ctrl-C, a crash or a lost connection. Running the same
+command again (same `--out`) continues where it stopped:
+
+- finished files are skipped — no request at all;
+- partly downloaded files continue from their last byte (`Range` request);
+- files that finished downloading but never got scanned are scanned, not
+  downloaded again;
+- failed downloads (the ones marked ✗) are tried again;
+- in the checkbox list, exactly the files you picked last time and haven't
+  got yet start checked.
+
+```text
+↻ continuing the earlier run in downloads: 40 already downloaded, 1 partly downloaded
+```
+
+A file counts as done only when the journal names the same link for it
+*and* it is still in the folder with the recorded size, so a same-named file
+from another source is never mistaken for it, and a file you deleted is
+downloaded again.
+
 **Malware scan** — every download is checked with ClamAV before it is
 saved; files with malware are deleted. See
 [Malware Scan (ClamAV)](#malware-scan-clamav).
@@ -144,7 +216,7 @@ saved; files with malware are deleted. See
 | `--out`, `-o` | `downloads` | Output directory |
 | `--depth` | `1` | BFS crawl depth (web mode only) |
 | `--delay` | none | Minimum milliseconds between requests (across all jobs) |
-| `--continue` | off | Resume `.part` files, skip files already downloaded |
+| `--continue` | off | Also skip/resume files marcopolo has no progress record for (any same-named file or `.part`) |
 | `--retries` | `3` | Retry attempts on failure |
 | `--jobs`, `-j` | `4` | Files downloaded in parallel (1–64) |
 | `--list` | off | Dry run — list files without downloading |
@@ -312,6 +384,72 @@ marcopolo reads the README and every other doc in the repo, finds all `https://.
 
 ---
 
+### Download PDFs linked on archive.org
+
+Reading lists often link archive.org book pages instead of the PDFs. marcopolo
+follows them to the real files:
+
+```bash
+marcopolo https://github.com/valeman/Awesome_Math_Books
+```
+
+```text
+→ looking up the files behind 233 archive.org link(s) …
+note: 26 archive.org item(s) are lend-only (borrow them on archive.org): principlesofmath00rudi, …
+note: 18 archive.org item(s) no longer exist (dead links): CalculusSpivak, …
+note: 1 archive.org item(s) have no pdf files.
+note: 4 duplicate file(s) skipped (an older copy in a sub-folder, or the same file in another item).
+✓ 208 file(s) discovered
+```
+
+An archive.org item or search page can also be given directly:
+
+```bash
+marcopolo https://archive.org/details/kolmogorov_202112
+marcopolo "https://archive.org/search?query=creator:\"I. V. Savelyev\""
+```
+
+To search archive.org by title instead, use `find`:
+`marcopolo find "Clean Code" --source archive`.
+
+---
+
+### Download PDFs shared on Google Drive
+
+Links to Drive files in a README or on a web page are followed to the file:
+
+```bash
+marcopolo https://github.com/mike-bowles/hdDeepLearningStudy
+```
+
+```text
+→ looking up 4 Google Drive link(s) …
+note: 2 Google Drive file(s) are private, deleted or over their download limit: 1wPHMA4PqygawvIxRiy-2ZMKcpUO447cz, …
+```
+
+Repos that share whole Drive folders work the same way:
+
+```bash
+marcopolo https://github.com/GaetanoLongo/PowerElectronics
+```
+
+```text
+→ 15 Google Drive folder(s) listed: 114 pdf file(s) inside
+note: 75 Google Drive file(s) are not pdf: [Barry Williams] Power Electronics Devices, ….zip, …
+✓ 114 file(s) discovered
+```
+
+A Drive file or folder link can also be given directly:
+
+```bash
+marcopolo https://drive.google.com/file/d/1Rx7MAekKZbyNVc5B2MNfR0HXXIEJCksp/view
+# → optimization.pdf
+marcopolo https://drive.google.com/drive/folders/17-9yPFfkiO6sqEDcYMIKLKGCKT_vaSsp
+# → the 11 PDFs in the folder
+```
+
+---
+
 ### Download PDFs from a website
 
 ```bash
@@ -407,13 +545,21 @@ visible to other users via `ps`) and is only sent to GitHub hosts.
 
 ### Resume an interrupted download
 
+Pressed Ctrl-C, lost the connection, or some files failed? Run the same
+command again:
+
 ```bash
-marcopolo https://github.com/owner/repo --continue
+marcopolo https://github.com/owner/repo     # stopped halfway
+marcopolo https://github.com/owner/repo     # continues where it stopped
 ```
 
-Files that are already fully downloaded are skipped without a request, and
-`.part` files are continued with a `Range` request instead of restarting
-from zero. Retries within a run always resume from the bytes already received.
+Finished files are skipped without a request, `.part` files continue with a
+`Range` request instead of restarting from zero, and failed files are tried
+again. Retries within a run always resume from the bytes already received.
+
+For a folder filled before marcopolo kept progress (no
+`.marcopolo-progress.jsonl` in it), add `--continue`: it trusts any
+same-named file and any `.part` file there.
 
 ---
 
