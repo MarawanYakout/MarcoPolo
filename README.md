@@ -43,30 +43,40 @@ package manager — see [Malware Scan (ClamAV)](#malware-scan-clamav).
 
 ##  Usage
 
-Just point marcopolo at any URL and it handles the rest:
+Just point marcopolo at any URL and it handles the rest — no subcommand
+needed, a link on its own is scraped:
 
 ```bash
 marcopolo https://github.com/owner/repo
+# same as: marcopolo scrape https://github.com/owner/repo
 ```
 
-That's it. It crawls the page and downloads everything it finds.
+That's it. It finds the files, shows them in a checkbox list so you choose
+what to download, then checks each download for malware with ClamAV.
 
 ---
 
 ## Usage
 
-Want to target specific file types? Use `--type`:
+Want to target specific file types? Use `--type` (default: `pdf`; repeat it
+to grab several, e.g. `--type pdf --type img`):
 
 | Flag | What it grabs |
 |------|--------------|
-| `--type pdf` | PDF documents |
-| `--type img` | Images (png, jpg, gif, webp, svg) |
-| `--type video` | Video files (mp4, mkv, avi, mov) |
+| `--type pdf` | PDF documents (pdf) |
+| `--type text` | Text & document files (txt, md, epub, doc, docx, csv, rst) |
+| `--type img` | Images (jpg, jpeg, png, gif, svg, webp, bmp, ico) |
+| `--type video` | Video files (mp4, mkv, avi, mov, webm, flv, m4v) |
+
+**Planned** — these types are not accepted yet and will be added in a future
+version (using them today gives an error):
+
+| Flag | What it will grab |
+|------|--------------|
 | `--type audio` | Audio files (mp3, wav, flac, ogg) |
 | `--type zip` | Archives (zip, tar, gz, rar, 7z) |
-| `--type doc` | Word / text docs (docx, doc, txt, odt) |
 | `--type code` | Source files (rs, py, js, ts, go, cpp) |
-| `--type data` | Data files (csv, json, xml, yaml) |
+| `--type data` | Data files (json, xml, yaml) |
 | `--type all` | Everything |
 
 ### Additional flags
