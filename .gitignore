@@ -1,1 +1,5 @@
 /target
+
+# Local notes: ignore every Markdown file except the README
+*.md
+!README.md

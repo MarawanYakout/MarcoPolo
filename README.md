@@ -35,6 +35,10 @@ marcopolo --version
 # marcopolo 0.3.0
 ```
 
+**Recommended:** install the free ClamAV antivirus as well, so every download
+is checked for malware. It is a separate program, installed with your own
+package manager — see [Malware Scan (ClamAV)](#malware-scan-clamav).
+
 ---
 
 ##  Usage
@@ -82,10 +86,10 @@ Marcopolo operates in two modes depending on the URL you give it:
 
 **GitHub mode** — when the URL is on `github.com`:
 1. Scans the full repository tree for committed files
-2. Decodes the README and extracts all hyperlinks (`/blob/` links are
-   rewritten to the raw file)
+2. Reads every README and Markdown/reST doc in the repo (not just the root
+   README) and extracts all file links (`/blob/` links are rewritten to the
+   raw file) — reading-list repos keep their PDF links in nested docs
 3. Scans all GitHub Release assets
-4. All three run in parallel
 
 **Web mode** — for any other URL:
 1. Checks `/sitemap.xml` at the root domain first (fast path)
@@ -96,8 +100,28 @@ All discovered files are deduplicated by URL, then downloaded concurrently
 (4 at a time by default, see `--jobs`) into `./downloads/`. Files with the same
 name get `_1`, `_2`, … suffixes instead of overwriting each other.
 
+**Choose before downloading** — in a terminal, marcopolo shows every
+discovered file in a checkbox list, all checked. Untick what you don't want,
+then press `d`:
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `k` `j` | Move (`PgUp` / `PgDn` jump a page) |
+| `space` | Check / uncheck |
+| `a` | Check all / none |
+| `enter` | Show / hide the full link (links are shortened to `host/…/file.pdf`) |
+| `d` | Download the checked files |
+| `q` / `esc` | Quit without downloading |
+
+With `--quiet`, or when output is piped (scripts, cron), there is no list and
+everything is downloaded as before.
+
 Each file streams to `<name>.part` and is renamed only when complete, so an
 interrupted run never leaves a truncated file behind under the real name.
+
+**Malware scan** — every download is checked with ClamAV before it is
+saved; files with malware are deleted. See
+[Malware Scan (ClamAV)](#malware-scan-clamav).
 
 ---
 
@@ -116,6 +140,7 @@ interrupted run never leaves a truncated file behind under the real name.
 | `--list` | off | Dry run — list files without downloading |
 | `--filter` | none | Only download files matching this keyword |
 | `--quiet` | off | Suppress all output except errors |
+| `--no-scan` | off | Skip the ClamAV malware scan (also on `find`) |
 
 A GitHub token is read from the `GITHUB_TOKEN` (or `MARCOPOLO_GITHUB_TOKEN`)
 environment variable — see [Use a GitHub token](#use-a-github-token-recommended).
@@ -128,6 +153,130 @@ environment variable — see [Use a GitHub token](#use-a-github-token-recommende
 | `text` | `.txt` `.md` `.epub` `.doc` `.docx` `.csv` `.rst` |
 | `img` | `.jpg` `.jpeg` `.png` `.gif` `.svg` `.webp` `.bmp` `.ico` |
 | `video` | `.mp4` `.mkv` `.avi` `.mov` `.webm` `.flv` `.m4v` |
+
+---
+
+## Malware Scan (ClamAV)
+
+marcopolo checks every file it downloads with
+[ClamAV](https://www.clamav.net), the free open-source antivirus, so a
+poisoned PDF never lands in your folder.
+
+**How it works**
+
+1. Each finished download goes into an isolated folder, `<out>/quarantine/`,
+   instead of straight into `<out>/`.
+2. When the batch is done, ClamAV scans the whole folder in one run (about
+   7 seconds — that is ClamAV loading its virus signatures).
+3. Each file then gets one of three results:
+   - **clean** → moved into `<out>/`.
+   - **malware** → **deleted**, with a red note naming the file and what
+     ClamAV found.
+   - **could not be checked** (e.g. ClamAV's signatures failed to load) →
+     left in `<out>/quarantine/` for you to decide.
+4. A scan result is printed, every outcome is written to `marcopolo.log`, and
+   marcopolo exits with code 1 if anything was deleted or left in quarantine.
+
+### Install ClamAV
+
+ClamAV is **not** bundled with marcopolo — install it separately with your
+system's package manager. marcopolo finds it automatically (it runs
+`clamscan` from your `PATH`).
+
+| System | Install command |
+|---|---|
+| Arch / Manjaro / EndeavourOS | `sudo pacman -S clamav` *(official `extra` repo — no AUR needed; `yay -S clamav` / `paru -S clamav` also work)* |
+| Debian / Ubuntu / Mint | `sudo apt install clamav clamav-freshclam` |
+| Fedora / RHEL | `sudo dnf install clamav clamav-update` |
+| openSUSE | `sudo zypper install clamav` |
+| macOS | `brew install clamav` *(then see the note below)* |
+| Windows | installer from [clamav.net/downloads](https://www.clamav.net/downloads) |
+
+**Download the virus signatures** (required before the first scan, and
+whenever they get old):
+
+```bash
+sudo freshclam
+```
+
+**Keep them updated automatically** (recommended — otherwise new malware is
+missed):
+
+```bash
+# Arch, Fedora
+sudo systemctl enable --now clamav-freshclam
+# Debian / Ubuntu: the clamav-freshclam service already runs after install
+# (a manual `sudo freshclam` may then report a locked log file — that's fine)
+```
+
+**macOS (Homebrew)** needs a config file before `freshclam` runs:
+
+```bash
+cp "$(brew --prefix)/etc/clamav/freshclam.conf.sample" "$(brew --prefix)/etc/clamav/freshclam.conf"
+sed -i '' '/^Example/d' "$(brew --prefix)/etc/clamav/freshclam.conf"
+freshclam
+```
+
+**Check it works:**
+
+```bash
+clamscan --version
+# ClamAV 1.5.4/28158/Mon Oct 19 09:26:01 2026   ← engine / signature version / signature date
+```
+
+The date at the end is when your signatures were last updated. marcopolo
+shows it in every scan result, so you can see if they are getting old.
+
+### Example 1 — a good file
+
+```bash
+marcopolo https://github.com/MarawanYakout/MarcoPolo --type img
+```
+
+```text
+🛡 scan result: 1 file(s) in 7 seconds  [ClamAV 1.5.4, signatures v28158 (Mon Oct 19 09:26:01 2026)]
+  ✓ clean        logo.png
+  1 clean · 0 malware · 0 not scanned — no threats found
+
+✓ 1 file(s) saved (37.49 KiB in 9 seconds) → downloads
+```
+
+ClamAV found nothing, so `logo.png` is moved from `downloads/quarantine/` to
+`downloads/`, the empty quarantine folder is removed, and marcopolo exits
+with code 0.
+
+### Example 2 — a bad file
+
+This downloads the [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/):
+a harmless text string that every antivirus treats as malware, made for
+safely testing scanners.
+
+```bash
+marcopolo https://www.eicar.org/download-anti-malware-testfile/ --type text --depth 0
+```
+
+```text
+🛡 scan result: 1 file(s) in 7 seconds  [ClamAV 1.5.4, signatures v28158 (Mon Oct 19 09:26:01 2026)]
+  ✗ NOTE: "eicar.com.txt" contained malware (Eicar-Test-Signature) detected by ClamAV — the file was deleted.
+  0 clean · 1 malware · 0 not scanned — malware found and deleted
+
+✓ 0 file(s) saved (0 B in 7 seconds) → downloads
+✗ 1 file(s) contained malware and were deleted
+error: 1 file(s) contained malware and were deleted
+```
+
+The file never leaves quarantine: it is deleted on the spot (the red note is
+shown even with `--quiet`), `marcopolo.log` records
+`deleted (malware Eicar-Test-Signature, detected by ClamAV)`, and marcopolo
+exits with code 1 so scripts notice.
+
+### Without ClamAV, or turning it off
+
+- **ClamAV not installed** → a yellow warning says files are **not** scanned,
+  and downloads are saved as before.
+- **`--no-scan`** → skip the scan on purpose (works with `scrape` and `find`).
+- **Large files** → by default ClamAV only checks the first 100 MB of a file,
+  so very large videos are not fully scanned. PDFs are well under this.
 
 ---
 
@@ -149,7 +298,7 @@ Downloads all `.pdf` files committed in the repo into `./downloads/`.
 marcopolo "https://github.com/Carl-McBride-Ellis/Compendium-of-free-ML-reading-resources?tab=readme-ov-file"
 ```
 
-marcopolo decodes the README, finds all `https://...pdf` links, and downloads them.
+marcopolo reads the README and every other doc in the repo, finds all `https://...pdf` links, and lets you pick which to download.
 
 ---
 
@@ -376,10 +525,13 @@ are excluded), and the real PDF inside each item is looked up before download.
 
 ### Usage Examples
 
-**Search and preview results (default):**
+**Search and pick results (default):**
 ```bash
 marcopolo find "Clean Code"
 ```
+Results open in the same checkbox list as `scrape` (none checked): one line
+per result with a shortened link — press `enter` on a result to see its full
+link, `space` to check it, `d` to download.
 
 **Download the top match from each source:**
 ```bash

@@ -77,6 +77,10 @@ pub enum Command {
         /// Suppress all output except errors (useful for scripting).
         #[arg(long, default_value_t = false)]
         quiet: bool,
+
+        /// Skip the ClamAV malware scan (files are saved without being isolated and checked).
+        #[arg(long = "no-scan", default_value_t = false)]
+        no_scan: bool,
     },
 
     /// Search free book sources and optionally download results.
@@ -119,5 +123,9 @@ pub enum Command {
         /// Suppress all output except errors (useful for scripting).
         #[arg(long, default_value_t = false)]
         quiet: bool,
+
+        /// Skip the ClamAV malware scan (files are saved without being isolated and checked).
+        #[arg(long = "no-scan", default_value_t = false)]
+        no_scan: bool,
     },
 }

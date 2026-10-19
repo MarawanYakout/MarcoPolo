@@ -11,11 +11,14 @@
 mod cli;
 mod download;
 mod find;
+mod picker;
+mod scan;
 mod utils;
 mod web_scraper;
 
 // ── Standard library ──────────────────────────────────────────────────────────
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
     path::Path,
@@ -24,9 +27,9 @@ use std::{
 };
 
 // ── Third-party ───────────────────────────────────────────────────────────────
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::{header, Client};
@@ -34,6 +37,7 @@ use serde::Deserialize;
 use url::Url;
 
 use download::{download_all, DownloadOpts};
+use picker::Item;
 use utils::parsing::{encode_path, filename_from_url, safe_filename, unique_filename};
 
 // ── Error alias ───────────────────────────────────────────────────────────────
@@ -117,12 +121,9 @@ struct TreeEntry {
     path: String,
     #[serde(rename = "type")]
     kind: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadmeResponse {
-    content:  String,
-    encoding: String,
+    /// Bytes; only present for files (blobs).
+    #[serde(default)]
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,37 +213,29 @@ async fn default_branch(client: &Client, owner: &str, repo: &str) -> Result<Stri
     Ok(info.default_branch)
 }
 
-async fn file_content(
-    client: &Client,
-    owner:  &str,
-    repo:   &str,
-    path:   &str,
-) -> Result<String> {
-    #[derive(Deserialize)]
-    struct FileResp { content: String, encoding: String }
-
-    let url  = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
-    let resp = client.get(&url).send().await?;
-    if resp.status() == 404 { return Ok(String::new()); }
-
-    let f: FileResp = resp.error_for_status()?.json().await?;
-    if f.encoding != "base64" { return Ok(String::new()); }
-
-    let bytes = B64.decode(f.content.replace('\n', ""))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// One repo at one branch — the part every raw file URL shares.
+struct RepoRef<'a> {
+    owner:  &'a str,
+    repo:   &'a str,
+    branch: &'a str,
 }
 
-async fn repo_files(
-    client:  &Client,
-    owner:   &str,
-    repo:    &str,
-    branch:  &str,
-    exts:    &[&str],
-    subpath: Option<&str>,
-) -> Result<Vec<FileSource>> {
-    let branch = encode_path(branch);
-    let url  = format!(
-        "https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+impl RepoRef<'_> {
+    /// Direct download URL of `path` (served by raw.githubusercontent.com,
+    /// which does not count against the GitHub API rate limit).
+    fn raw_url(&self, path: &str) -> String {
+        format!(
+            "https://raw.githubusercontent.com/{}/{}/{}/{}",
+            self.owner, self.repo, encode_path(self.branch), encode_path(path),
+        )
+    }
+}
+
+/// Lists every file (blob) on the branch in one API call.
+async fn repo_tree(client: &Client, repo: &RepoRef<'_>) -> Result<Vec<TreeEntry>> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
+        repo.owner, repo.repo, encode_path(repo.branch),
     );
     let tree: GitTree = client
         .get(&url)
@@ -253,70 +246,96 @@ async fn repo_files(
     if tree.truncated {
         eprintln!("{} tree was truncated — some files may be missed.", "warning:".yellow());
     }
+    Ok(tree.tree.into_iter().filter(|e| e.kind == "blob").collect())
+}
 
-    let sources = tree
-        .tree
-        .into_iter()
-        .filter(|e| {
-            let in_scope = match subpath {
-                Some(sp) => e.path.starts_with(&format!("{sp}/")),
-                None     => true,
-            };
-            e.kind == "blob" && in_scope && matches_ext(&e.path, exts)
-        })
+/// `true` when `path` is inside the `/tree/<branch>/<subpath>` the user gave.
+fn in_subpath(path: &str, subpath: Option<&str>) -> bool {
+    subpath.is_none_or(|sp| path.starts_with(&format!("{sp}/")))
+}
+
+/// Committed files whose extension was asked for.
+fn tree_files(repo: &RepoRef<'_>, blobs: &[TreeEntry], exts: &[&str], subpath: Option<&str>) -> Vec<FileSource> {
+    blobs
+        .iter()
+        .filter(|e| in_subpath(&e.path, subpath) && matches_ext(&e.path, exts))
         .map(|e| {
-            let raw_url = format!(
-                "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{}",
-                encode_path(&e.path)
-            );
             let name = Path::new(&e.path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&e.path)
                 .to_owned();
-            FileSource { name, url: raw_url }
+            FileSource { name, url: repo.raw_url(&e.path) }
         })
-        .collect();
-
-    Ok(sources)
+        .collect()
 }
 
-async fn readme_files(
+/// Doc formats whose text is searched for file links.
+const DOC_EXTS: &[&str] = &["md", "markdown", "rst"];
+/// Docs larger than this are data, not link lists; skip them.
+const MAX_DOC_BYTES: u64 = 2 * 1024 * 1024;
+/// At most this many docs are read per repo, so a huge docs repo can't fire
+/// off thousands of requests.
+const MAX_DOCS: usize = 500;
+/// Docs fetched at the same time.
+const DOC_FETCH_JOBS: usize = 8;
+
+/// `true` for Markdown/reST files and any `README*` (GitHub shows those as the
+/// folder's front page, whatever their extension).
+fn is_doc(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches_ext(name, DOC_EXTS) || name.to_lowercase().starts_with("readme")
+}
+
+/// Reads every doc file in the repo and collects the file links inside.
+///
+/// Repos like reading lists keep their PDF links in nested READMEs and notes,
+/// not just the root README, so all of them are searched.
+async fn doc_links(
     client:  &Client,
-    owner:   &str,
-    repo:    &str,
+    repo:    &RepoRef<'_>,
+    blobs:   &[TreeEntry],
     exts:    &[&str],
     subpath: Option<&str>,
-) -> Result<Vec<FileSource>> {
-    let root_text = async {
-        let url  = format!("https://api.github.com/repos/{owner}/{repo}/readme");
-        let resp = client.get(&url).send().await?;
-        if resp.status() == 404 { return Ok::<String, Box<dyn std::error::Error>>(String::new()); }
-
-        let readme: ReadmeResponse = resp.error_for_status().map_err(github_error)?.json().await?;
-        if readme.encoding != "base64" { return Ok(String::new()); }
-
-        let bytes = B64.decode(readme.content.replace('\n', ""))?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    };
-
-    let sub_text = async {
-        match subpath {
-            Some(sp) => file_content(client, owner, repo, &format!("{sp}/README.md")).await,
-            None     => Ok(String::new()),
-        }
-    };
-
-    let (root, sub) = tokio::join!(root_text, sub_text);
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all:  Vec<FileSource> = Vec::new();
-    for text in [root.unwrap_or_default(), sub.unwrap_or_default()] {
-        for f in extract_file_links(&text, exts) {
-            if seen.insert(f.url.clone()) { all.push(f); }
-        }
+) -> Vec<FileSource> {
+    let docs: Vec<&TreeEntry> = blobs
+        .iter()
+        .filter(|e| in_subpath(&e.path, subpath) && is_doc(&e.path) && e.size <= MAX_DOC_BYTES)
+        .collect();
+    if docs.len() > MAX_DOCS {
+        eprintln!(
+            "{} {} doc files found; only the first {MAX_DOCS} are searched for links.",
+            "warning:".yellow(), docs.len(),
+        );
     }
-    Ok(all)
+
+    // `buffered` (not `buffer_unordered`) keeps results in tree order, so the
+    // list the user sees is stable from run to run.
+    let texts: Vec<Result<String>> = stream::iter(docs.iter().take(MAX_DOCS))
+        .map(|doc| async move {
+            let text = client
+                .get(repo.raw_url(&doc.path))
+                .send().await?
+                .error_for_status()?
+                .text().await?;
+            Ok(text)
+        })
+        .buffered(DOC_FETCH_JOBS)
+        .collect()
+        .await;
+
+    let failed = texts.iter().filter(|t| t.is_err()).count();
+    if failed > 0 {
+        eprintln!("{} {failed} doc file(s) could not be read for links.", "warning:".yellow());
+    }
+
+    let mut seen  = HashSet::new();
+    texts
+        .iter()
+        .flatten()
+        .flat_map(|text| extract_file_links(text, exts))
+        .filter(|f| seen.insert(f.url.clone()))
+        .collect()
 }
 
 async fn release_files(
@@ -420,6 +439,14 @@ fn parse_selection(input: &str, count: usize) -> Vec<usize> {
     indices
 }
 
+/// ` [PDF]` when the result's format is known, else empty.
+fn format_tag(r: &find::types::FindResult) -> String {
+    r.format
+        .as_deref()
+        .map(|f| format!(" [{}]", f.to_uppercase()))
+        .unwrap_or_default()
+}
+
 fn read_line_stdin() -> String {
     let mut buf = String::new();
     let _ = io::stdin().read_line(&mut buf);
@@ -503,7 +530,7 @@ async fn run() -> Result<()> {
 
     match cli.command {
         // ── scrape subcommand ──────────────────────────────────────────────────
-        Command::Scrape { url, kinds, out, depth, delay, resume, retries, jobs, list, filter, quiet } => {
+        Command::Scrape { url, kinds, out, depth, delay, resume, retries, jobs, list, filter, quiet, no_scan } => {
             let exts   = all_extensions(&kinds);
 
             if !quiet {
@@ -526,7 +553,7 @@ async fn run() -> Result<()> {
                     if let Some(ref sp) = subpath {
                         println!("{} subdirectory scope: {}", "→".dimmed(), sp.cyan());
                     }
-                    println!("{} scanning repo tree, README, and releases …", "→".dimmed());
+                    println!("{} scanning repo tree, docs, and releases …", "→".dimmed());
                 }
 
                 let branch = match branch_from_url {
@@ -534,28 +561,32 @@ async fn run() -> Result<()> {
                     None    => default_branch(&gh_client, &owner, &repo).await?,
                 };
                 let sp = subpath.as_deref();
+                let repo_ref = RepoRef { owner: &owner, repo: &repo, branch: &branch };
 
-                let (tree_r, readme_r, releases_r) = tokio::join!(
-                    repo_files(&gh_client, &owner, &repo, &branch, &exts, sp),
-                    readme_files(&gh_client, &owner, &repo, &exts, sp),
+                let (tree_r, releases_r) = tokio::join!(
+                    repo_tree(&gh_client, &repo_ref),
                     release_files(&gh_client, &owner, &repo, &exts),
                 );
 
-                let mut seen:  HashSet<String> = HashSet::new();
-                let mut files: Vec<FileSource> = Vec::new();
-                for (label, result) in [("repo tree", tree_r), ("README", readme_r), ("releases", releases_r)] {
-                    match result {
-                        Ok(found) => {
-                            for f in found {
-                                if seen.insert(f.url.clone()) { files.push(f); }
-                            }
-                        }
-                        // Surface failures (e.g. 403 rate limit) instead of
-                        // silently reporting "No files found."
-                        Err(e) => eprintln!("{} {label} scan failed: {e}", "warning:".yellow()),
+                // Committed files first, then links found in docs, then release assets.
+                let mut found: Vec<FileSource> = Vec::new();
+                match tree_r {
+                    Ok(blobs) => {
+                        found.extend(tree_files(&repo_ref, &blobs, &exts, sp));
+                        found.extend(doc_links(&gh_client, &repo_ref, &blobs, &exts, sp).await);
                     }
+                    // Surface failures (e.g. 403 rate limit) instead of
+                    // silently reporting "No files found."
+                    Err(e) => eprintln!("{} repo tree scan failed: {e}", "warning:".yellow()),
                 }
-                files
+                match releases_r {
+                    Ok(assets) => found.extend(assets),
+                    Err(e) => eprintln!("{} releases scan failed: {e}", "warning:".yellow()),
+                }
+
+                let mut seen = HashSet::new();
+                found.retain(|f| seen.insert(f.url.clone()));
+                found
             } else {
                 if !quiet {
                     println!(
@@ -612,16 +643,37 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            let opts = DownloadOpts { jobs: jobs.into(), resume, delay_ms: delay, retries, quiet };
-            let summary = download_all(&client, &gh_client, &all, &out, &opts).await?;
-            if summary.failed > 0 {
-                // Non-zero exit so scripts notice partial failures.
-                return Err(format!("{} download(s) failed", summary.failed).into());
+            // On a real terminal, show every file pre-checked and let the user
+            // untick what they don't want before anything is downloaded.
+            if !quiet && picker::is_interactive() {
+                let items: Vec<Item> = all
+                    .iter()
+                    .map(|f| Item { label: Cow::Borrowed(f.name.as_str()), link: &f.url })
+                    .collect();
+                let Some(chosen) = picker::pick("Select files to download", &items, true)? else {
+                    println!("{} nothing downloaded.", "✗".dimmed());
+                    return Ok(());
+                };
+                let chosen: HashSet<usize> = chosen.into_iter().collect();
+                all = all
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| chosen.contains(&i).then_some(f))
+                    .collect();
+                if all.is_empty() {
+                    println!("{} nothing selected — nothing downloaded.", "✗".dimmed());
+                    return Ok(());
+                }
+                println!("{} {} file(s) selected", "✓".green().bold(), all.len().to_string().green().bold());
             }
+
+            let opts = DownloadOpts { jobs: jobs.into(), resume, delay_ms: delay, retries, quiet, scan: !no_scan };
+            // Non-zero exit so scripts notice failed or quarantined files.
+            download_all(&client, &gh_client, &all, &out, &opts).await?.into_result()?;
         }
 
         // ── find subcommand ────────────────────────────────────────────────────
-        Command::Find { query, list, get, source, format, out, jobs, quiet } => {
+        Command::Find { query, list, get, source, format, out, jobs, quiet, no_scan } => {
             if !utils::validation::is_valid_query(&query) {
                 eprintln!("{} query must not be empty.", "error:".red().bold());
                 std::process::exit(1);
@@ -674,7 +726,11 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            if !quiet {
+            // A person at a terminal gets the checkbox list (short links, Enter
+            // expands one); --list, --get and pipes keep the plain printout.
+            let interactive = !quiet && !list && !get && picker::is_interactive();
+
+            if !quiet && !interactive {
                 println!(
                     "\n{} {} result(s) for \"{}\":\n",
                     "✓".green().bold(),
@@ -682,10 +738,7 @@ async fn run() -> Result<()> {
                     query.yellow(),
                 );
                 for (i, r) in results.iter().enumerate() {
-                    let fmt_tag = r.format
-                        .as_deref()
-                        .map(|f| format!(" [{}]", f.to_uppercase()))
-                        .unwrap_or_default();
+                    let fmt_tag = format_tag(r);
                     println!(
                         "  {}. ({})  {}{}",
                         format!("{:>2}", i + 1).bold(),
@@ -710,6 +763,23 @@ async fn run() -> Result<()> {
                 // In quiet mode without --get there is nothing to select interactively;
                 // just download everything.
                 (0..results.len()).collect()
+            } else if interactive {
+                let items: Vec<Item> = results
+                    .iter()
+                    .map(|r| Item {
+                        label: Cow::Owned(format!("({}) {}{}", r.source, r.title, format_tag(r))),
+                        link:  &r.url,
+                    })
+                    .collect();
+                let title = format!("{} result(s) for \"{query}\" — check what to download", results.len());
+                let Some(chosen) = picker::pick(&title, &items, false)? else {
+                    println!("{} nothing downloaded.", "✗".dimmed());
+                    return Ok(());
+                };
+                if chosen.is_empty() {
+                    println!("{} nothing selected — nothing downloaded.", "✗".dimmed());
+                }
+                chosen
             } else {
                 println!(
                     "{}",
@@ -784,11 +854,8 @@ async fn run() -> Result<()> {
                 );
             }
 
-            let opts = DownloadOpts { jobs: jobs.into(), resume: false, delay_ms: None, retries: 3, quiet };
-            let summary = download_all(&client, &gh_client, &files, &out, &opts).await?;
-            if summary.failed > 0 {
-                return Err(format!("{} download(s) failed", summary.failed).into());
-            }
+            let opts = DownloadOpts { jobs: jobs.into(), resume: false, delay_ms: None, retries: 3, quiet, scan: !no_scan };
+            download_all(&client, &gh_client, &files, &out, &opts).await?.into_result()?;
         }
     }
 

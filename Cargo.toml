@@ -20,9 +20,9 @@ name = "marcopolo"
 path = "src/main.rs"
 
 [dependencies]
-base64            = "0.22"
 clap              = { version = "4",    features = ["derive"] }
 colored           = "2"
+console           = "0.15"  # key input + redraw for the checkbox picker (already used by indicatif)
 futures           = "0.3"
 indicatif         = "0.17"
 percent-encoding  = "2"

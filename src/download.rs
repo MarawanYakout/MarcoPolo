@@ -9,6 +9,9 @@
 //! - `--delay` spaces request starts across *all* parallel workers.
 //! - Each active download gets its own bar with real bytes and bytes/sec.
 //! - Every outcome is appended to `<out>/marcopolo.log`.
+//! - With scanning on, finished files wait in `<out>/quarantine/` until one
+//!   ClamAV run over the batch clears them (see `scan.rs`). Files ClamAV
+//!   finds malware in are deleted.
 
 use std::{
     ffi::OsString,
@@ -25,7 +28,11 @@ use indicatif::{
 use reqwest::{header, Client, Response, StatusCode};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use crate::{matches_ext, FileSource, Result};
+use crate::{
+    matches_ext,
+    scan::{self, Verdict},
+    FileSource, Result,
+};
 
 /// Settings shared by every file in one run.
 pub struct DownloadOpts {
@@ -39,11 +46,34 @@ pub struct DownloadOpts {
     pub retries:  u32,
     /// Hide progress and success lines (errors are still printed).
     pub quiet:    bool,
+    /// Isolate finished files and scan them with ClamAV before saving.
+    pub scan:     bool,
 }
 
 /// What a finished run did.
 pub struct Summary {
-    pub failed: usize,
+    failed:      usize,
+    /// Files ClamAV could not check, held back in `<out>/quarantine/`.
+    quarantined: usize,
+    /// Files ClamAV found malware in; they were deleted.
+    deleted:     usize,
+}
+
+impl Summary {
+    /// Turns failed, deleted or quarantined files into an error, so the
+    /// process exits non-zero and scripts notice.
+    pub fn into_result(self) -> Result<()> {
+        if self.failed > 0 {
+            return Err(format!("{} download(s) failed", self.failed).into());
+        }
+        if self.deleted > 0 {
+            return Err(format!("{} file(s) contained malware and were deleted", self.deleted).into());
+        }
+        if self.quarantined > 0 {
+            return Err(format!("{} file(s) kept in quarantine by the malware scan", self.quarantined).into());
+        }
+        Ok(())
+    }
 }
 
 enum Outcome {
@@ -51,6 +81,10 @@ enum Outcome {
     Downloaded(u64),
     /// Already on disk from an earlier `--continue` run.
     Skipped,
+    /// Downloaded, but the malware scan kept it in quarantine; holds why.
+    Quarantined(String),
+    /// ClamAV found malware and the file was deleted; holds the signature name.
+    Deleted(String),
 }
 
 /// Downloads `files` into `out` and prints/logs the result of each one.
@@ -66,6 +100,23 @@ pub async fn download_all(
     opts:      &DownloadOpts,
 ) -> Result<Summary> {
     tokio::fs::create_dir_all(out).await?;
+
+    // The scan needs ClamAV; without it, warn loudly and save files unscanned.
+    let clamav = if opts.scan { scan::clamscan_version().await } else { None };
+    let scanning = clamav.is_some();
+    if opts.scan && !scanning {
+        eprintln!(
+            "{} ClamAV (clamscan) not found — files will NOT be scanned for malware. \
+             Install ClamAV, or pass --no-scan to hide this warning.",
+            "warning:".yellow(),
+        );
+    }
+    let quarantine = out.join(scan::QUARANTINE_DIR);
+    if scanning {
+        tokio::fs::create_dir_all(&quarantine).await?;
+    }
+    // Where finished files are moved: quarantine until scanned, else `out`.
+    let land_in = if scanning { quarantine.as_path() } else { out };
 
     let mp = if opts.quiet {
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
@@ -85,7 +136,7 @@ pub async fn download_all(
     let pacer   = Pacer::new(opts.delay_ms);
     let started = Instant::now();
 
-    let results: Vec<(&FileSource, String, Result<Outcome>)> = stream::iter(files)
+    let mut results: Vec<(&FileSource, String, Result<Outcome>)> = stream::iter(files)
         .map(|src| {
             let (mp, overall, pacer) = (&mp, &overall, &pacer);
             async move {
@@ -94,7 +145,7 @@ pub async fn download_all(
                 } else {
                     client
                 };
-                let r = download_one(c, src, out, opts, pacer, mp).await;
+                let r = download_one(c, src, out, land_in, opts, pacer, mp).await;
                 match &r {
                     Ok(Outcome::Downloaded(size)) => {
                         let _ = mp.println(format!(
@@ -108,6 +159,8 @@ pub async fn download_all(
                             "·".dimmed(), src.name.dimmed(), "already downloaded".dimmed(),
                         ));
                     }
+                    // Only set later, by the scan.
+                    Ok(Outcome::Quarantined(_) | Outcome::Deleted(_)) => {}
                     // Errors are shown even in --quiet mode.
                     Err(e) => mp.suspend(|| {
                         eprintln!("  {} {}: {e}", "✗".red().bold(), src.name);
@@ -123,12 +176,20 @@ pub async fn download_all(
 
     overall.finish_and_clear();
 
+    if scanning {
+        let clamav = clamav.as_deref().unwrap_or("ClamAV");
+        scan_and_release(&mut results, out, &quarantine, clamav, opts.quiet).await;
+    }
+
     let (mut ok, mut skipped, mut failed, mut bytes) = (0usize, 0usize, 0usize, 0u64);
+    let (mut quarantined, mut deleted) = (0usize, 0usize);
     let mut log = String::new();
     for (src, stamp, r) in &results {
         let status = match r {
             Ok(Outcome::Downloaded(size)) => { ok += 1; bytes += size; "ok".to_owned() }
             Ok(Outcome::Skipped)          => { skipped += 1; "ok (already downloaded)".to_owned() }
+            Ok(Outcome::Quarantined(why)) => { quarantined += 1; format!("quarantined ({why})") }
+            Ok(Outcome::Deleted(sig))     => { deleted += 1; format!("deleted (malware {sig}, detected by ClamAV)") }
             Err(e)                        => { failed += 1; format!("error: {e}") }
         };
         let _ = writeln!(log, "[{stamp}] {status}  {}  {}", src.name, src.url);
@@ -154,20 +215,37 @@ pub async fn download_all(
         if failed > 0 {
             println!("{} {} download(s) failed", "✗".red().bold(), failed.to_string().red());
         }
+        if deleted > 0 {
+            println!(
+                "{} {} file(s) contained malware and were deleted",
+                "✗".red().bold(),
+                deleted.to_string().red().bold(),
+            );
+        }
+        if quarantined > 0 {
+            println!(
+                "{} {} file(s) kept in quarantine → {}",
+                "⚠".red().bold(),
+                quarantined.to_string().red(),
+                quarantine.display().to_string().red().bold(),
+            );
+        }
         println!("{} log → {}", "·".dimmed(), log_path.display().to_string().dimmed());
     }
 
-    Ok(Summary { failed })
+    Ok(Summary { failed, quarantined, deleted })
 }
 
-/// Downloads one file via its `.part` file and moves it into place.
+/// Downloads one file via its `.part` file and moves it into `land_in`
+/// (`out`, or the quarantine folder when scanning).
 async fn download_one(
-    client: &Client,
-    src:    &FileSource,
-    out:    &Path,
-    opts:   &DownloadOpts,
-    pacer:  &Pacer,
-    mp:     &MultiProgress,
+    client:  &Client,
+    src:     &FileSource,
+    out:     &Path,
+    land_in: &Path,
+    opts:    &DownloadOpts,
+    pacer:   &Pacer,
+    mp:      &MultiProgress,
 ) -> Result<Outcome> {
     let dest = out.join(&src.name);
     if opts.resume && tokio::fs::try_exists(&dest).await.unwrap_or(false) {
@@ -183,9 +261,125 @@ async fn download_one(
     mp.remove(&pb);
     fetched?;
 
-    tokio::fs::rename(&part, &dest).await?;
-    let size = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
+    let saved = land_in.join(&src.name);
+    tokio::fs::rename(&part, &saved).await?;
+    let size = tokio::fs::metadata(&saved).await.map(|m| m.len()).unwrap_or(0);
     Ok(Outcome::Downloaded(size))
+}
+
+/// Scans the quarantine folder with one ClamAV run, then per file:
+/// clean → moved into `out`; malware → deleted (`Deleted`); no clear answer
+/// → left in quarantine (`Quarantined`), to be safe.
+///
+/// Prints the scan result: a header, one line per file and the totals.
+/// With `quiet`, only deleted and quarantined files are printed.
+async fn scan_and_release(
+    results:    &mut [(&FileSource, String, Result<Outcome>)],
+    out:        &Path,
+    quarantine: &Path,
+    clamav:     &str,
+    quiet:      bool,
+) {
+    let count = results
+        .iter()
+        .filter(|(_, _, r)| matches!(r, Ok(Outcome::Downloaded(_))))
+        .count();
+    if count > 0 {
+        let spinner = if quiet { ProgressBar::hidden() } else { ProgressBar::new_spinner() };
+        spinner.set_message(format!("scanning {count} file(s) for malware with ClamAV…"));
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        let started = Instant::now();
+        let mut report = scan::scan_dir(quarantine).await;
+        spinner.finish_and_clear();
+
+        if !quiet {
+            println!(
+                "\n{} {} {} file(s) in {}  {}",
+                "🛡".cyan().bold(),
+                "scan result:".cyan().bold(),
+                count,
+                HumanDuration(started.elapsed()),
+                format!("[{clamav}]").dimmed(),
+            );
+        }
+        let (mut clean, mut infected, mut unscanned) = (0usize, 0usize, 0usize);
+
+        for (src, _, r) in results.iter_mut() {
+            if !matches!(r, Ok(Outcome::Downloaded(_))) {
+                continue;
+            }
+            let verdict = match &mut report {
+                Ok(verdicts) => verdicts
+                    .remove(&src.name)
+                    .unwrap_or_else(|| Verdict::Unscanned("no result from clamscan".into())),
+                Err(e) => Verdict::Unscanned(format!("clamscan failed: {e}")),
+            };
+            let in_quarantine = quarantine.join(&src.name);
+            match verdict {
+                Verdict::Clean => match tokio::fs::rename(&in_quarantine, out.join(&src.name)).await {
+                    Ok(()) => {
+                        clean += 1;
+                        if !quiet {
+                            println!("  {} {:<12} {}", "✓".green().bold(), "clean".green(), src.name);
+                        }
+                    }
+                    Err(e) => {
+                        unscanned += 1;
+                        keep_in_quarantine(r, &src.name, format!("clean, but could not leave quarantine: {e}"));
+                    }
+                },
+                Verdict::Infected(signature) => {
+                    infected += 1;
+                    match tokio::fs::remove_file(&in_quarantine).await {
+                        Ok(()) => {
+                            // Shown even in --quiet mode, like errors.
+                            eprintln!(
+                                "  {} {}",
+                                "✗ NOTE:".red().bold(),
+                                format!(
+                                    "\"{}\" contained malware ({signature}) detected by ClamAV — the file was deleted.",
+                                    src.name,
+                                ).red().bold(),
+                            );
+                            *r = Ok(Outcome::Deleted(signature));
+                        }
+                        Err(e) => keep_in_quarantine(
+                            r,
+                            &src.name,
+                            format!("malware ({signature}) detected by ClamAV, but deleting it failed: {e}"),
+                        ),
+                    }
+                }
+                Verdict::Unscanned(reason) => {
+                    unscanned += 1;
+                    keep_in_quarantine(r, &src.name, format!("not scanned: {reason}"));
+                }
+            }
+        }
+
+        if !quiet {
+            let verdict = match (infected, unscanned) {
+                (0, 0) => "no threats found".green().bold(),
+                (0, _) => "unchecked files kept in quarantine".yellow().bold(),
+                (_, _) => "malware found and deleted".red().bold(),
+            };
+            println!(
+                "  {} clean · {} malware · {} not scanned — {verdict}",
+                clean.to_string().green(), infected.to_string().red(), unscanned.to_string().yellow(),
+            );
+        }
+    }
+    // Succeeds only when the folder is empty, i.e. nothing was left behind.
+    let _ = tokio::fs::remove_dir(quarantine).await;
+}
+
+/// Marks a file as left in quarantine and says why (shown even in --quiet).
+fn keep_in_quarantine(r: &mut Result<Outcome>, name: &str, why: String) {
+    eprintln!(
+        "  {} {:<12} {}  {}",
+        "⚠".yellow().bold(), "quarantined".yellow().bold(), name, format!("— {why}").yellow(),
+    );
+    *r = Ok(Outcome::Quarantined(why));
 }
 
 /// Fetches `src` into `part`, retrying transient failures.
